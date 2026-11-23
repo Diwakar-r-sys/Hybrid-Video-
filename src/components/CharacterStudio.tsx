@@ -20,6 +20,7 @@ interface CharacterStudioProps {
   onGenerateGeminiSheet: (charName: string, description: string) => Promise<void>;
   onAutoLabelPieces: (charName: string) => Promise<void>;
   isBusy: boolean;
+  liveProgressText?: string | null;
 }
 
 const PIECE_ROLES: PieceRole[] = [
@@ -45,7 +46,8 @@ export const CharacterStudio: React.FC<CharacterStudioProps> = ({
   onUploadCustomSheet,
   onGenerateGeminiSheet,
   onAutoLabelPieces,
-  isBusy
+  isBusy,
+  liveProgressText
 }) => {
   const activeChar =
     characters.find((c) => c.name === activeCharacterName) || characters[0];
@@ -216,8 +218,13 @@ export const CharacterStudio: React.FC<CharacterStudioProps> = ({
               className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 text-xs font-semibold cursor-pointer"
             >
               <Sparkles className="w-3.5 h-3.5" />
-              {isBusy ? 'Generating Character Parts...' : 'Generate Character Parts Sheet'}
+              {isBusy
+                ? liveProgressText || 'Generating Character Parts...'
+                : 'Generate Character Parts Sheet'}
             </button>
+            {isBusy && liveProgressText && (
+              <div className="text-[11px] font-mono text-amber-300">{liveProgressText}</div>
+            )}
           </div>
         </div>
 

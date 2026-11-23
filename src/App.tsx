@@ -98,9 +98,75 @@ class ApiRequestError extends Error {
   }
 }
 
-async function safeFetchJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(url, init);
+async function safeFetchJson<T>(
+  url: string,
+  init?: RequestInit,
+  onProgress?: (message: string) => void
+): Promise<T> {
+  const headers = new Headers(init?.headers || undefined);
+  if (onProgress && !headers.has('Accept')) {
+    headers.set('Accept', 'text/event-stream, application/json');
+  }
+
+  const res = await fetch(url, { ...init, headers });
   const contentType = res.headers.get('content-type') || '';
+
+  if (contentType.includes('text/event-stream') && res.body) {
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let finalResult: T | null = null;
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (value) {
+        buffer += decoder.decode(value, { stream: !done });
+      }
+      const chunks = buffer.split('\n\n');
+      buffer = done ? '' : chunks.pop() || '';
+
+      for (const chunk of chunks) {
+        for (const line of chunk.split('\n')) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+          const payloadStr = trimmed.slice(5).trim();
+          if (!payloadStr) continue;
+          let evt: Record<string, unknown>;
+          try {
+            evt = JSON.parse(payloadStr) as Record<string, unknown>;
+          } catch {
+            continue;
+          }
+          if (evt.type === 'progress' && typeof evt.message === 'string') {
+            onProgress?.(evt.message);
+          } else if (evt.type === 'error') {
+            const code = typeof evt.status === 'number'
+              ? evt.status
+              : typeof evt.code === 'number'
+              ? evt.code
+              : 500;
+            const msg = typeof evt.error === 'string' ? evt.error : `Server error ${code}`;
+            const retryable = Boolean(evt.retryable) || code === 503 || code === 429;
+            throw new ApiRequestError(msg, code, retryable);
+          } else if (evt.type === 'result') {
+            finalResult = evt as T;
+          }
+        }
+      }
+
+      if (done) break;
+    }
+
+    if (finalResult !== null) {
+      return finalResult;
+    }
+    throw new ApiRequestError(
+      `Stream ended without a final response from ${url}.`,
+      res.status || 502,
+      true
+    );
+  }
+
   const rawText = await res.text();
 
   if (!contentType.includes('application/json')) {
@@ -217,23 +283,56 @@ export default function App() {
   const [audioDataUrl, setAudioDataUrl] = useState<string | null>(null);
   const [exportProgress, setExportProgress] = useState<ExportProgress | null>(null);
   const [exportResult, setExportResult] = useState<ExportResult | null>(null);
+  const [lastModelUsed, setLastModelUsed] = useState<string | null>(null);
+  const [liveProgressText, setLiveProgressText] = useState<string | null>(null);
   const [statusNotice, setStatusNotice] = useState<{
+    tab: WorkspaceTab;
     type: 'info' | 'error';
     text: string;
-    canRetryAnalyze?: boolean;
+    retryAction?: 'analyze' | 'tts' | 'auto-label' | 'generate-sheet';
   } | null>(null);
 
   const engineRef = useRef<HybridStageEngine | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const knownLayoutsRef = useRef<Map<string, KnownPartBox[]>>(new Map());
+  const activeTabRef = useRef<WorkspaceTab>(activeTab);
+  activeTabRef.current = activeTab;
+
+  const lastTtsVoiceRef = useRef<string>('Kore');
+  const lastAutoLabelCharRef = useRef<string>('Grandma');
+  const lastGenSheetParamsRef = useRef<{ name: string; description: string } | null>(null);
 
   const showNotice = useCallback(
-    (text: string, type: 'info' | 'error' = 'info', canRetryAnalyze = false) => {
-      setStatusNotice({ text, type, canRetryAnalyze });
+    (
+      text: string,
+      type: 'info' | 'error' = 'info',
+      retryAction?: 'analyze' | 'tts' | 'auto-label' | 'generate-sheet',
+      tabOverride?: WorkspaceTab
+    ) => {
+      setStatusNotice({
+        tab: tabOverride ?? activeTabRef.current,
+        type,
+        text,
+        retryAction
+      });
     },
     []
   );
+
+  // Auto-dismiss success/info notices after 6s
+  useEffect(() => {
+    if (!statusNotice || statusNotice.type !== 'info') return;
+    const timer = window.setTimeout(() => {
+      setStatusNotice((prev) => (prev === statusNotice ? null : prev));
+    }, 6000);
+    return () => window.clearTimeout(timer);
+  }, [statusNotice]);
+
+  const handleSelectTab = useCallback((nextTab: WorkspaceTab) => {
+    setStatusNotice(null);
+    setActiveTab(nextTab);
+  }, []);
 
   // 1. Initialize built-in Grandma, King & Soldier #FF00FF cutout rigs once on mount
   useEffect(() => {
@@ -400,6 +499,7 @@ export default function App() {
   const applyPreset = (presetId: string) => {
     const preset = BUILTIN_PRESETS.find((p) => p.id === presetId);
     if (!preset) return;
+    setStatusNotice(null);
     setIsPlaying(false);
     setActivePresetId(preset.id);
     setShots(preset.shots);
@@ -420,6 +520,8 @@ export default function App() {
   };
 
   const handleVideoFileUpload = async (file: File) => {
+    const originTab = activeTabRef.current;
+    setStatusNotice(null);
     try {
       setIsPlaying(false);
       if (uploadedVideoUrl) {
@@ -428,23 +530,31 @@ export default function App() {
       const url = URL.createObjectURL(file);
       setUploadedVideoUrl(url);
       setUploadedVideoName(file.name);
-      showNotice(`Extracting keyframes from ${file.name}...`);
+      showNotice(`Extracting keyframes from ${file.name}...`, 'info', undefined, originTab);
       const { duration, frames } = await extractFramesFromVideoFile(url, 10);
       setKeyframes(frames);
       setTargetDuration(Math.min(66, Math.max(2, Math.round(duration))));
       setHasUnanalyzedUpload(true);
       showNotice(
-        `Extracted ${frames.length} keyframes (${duration.toFixed(1)}s) from ${file.name}. Click "Generate 3D Storyboard & Animation" to build the ${Math.round(duration)}s timeline.`
+        `Extracted ${frames.length} keyframes (${duration.toFixed(1)}s) from ${file.name}. Click "Generate 3D Storyboard & Animation" to build the ${Math.round(duration)}s timeline.`,
+        'info',
+        undefined,
+        originTab
       );
     } catch (err: unknown) {
       showNotice(
         err instanceof Error ? err.message : 'Failed to read video file.',
-        'error'
+        'error',
+        undefined,
+        originTab
       );
     }
   };
 
   const handleGenerateStoryboard = async () => {
+    const originTab = activeTabRef.current;
+    setStatusNotice(null);
+    setLiveProgressText(null);
     setIsAnalyzing(true);
     setIsPlaying(false);
     try {
@@ -470,20 +580,28 @@ export default function App() {
         modelUsed?: string;
         uniqueCharacters?: Array<{ name: string; description: string }>;
         shots?: ShotSpec[];
-      }>('/api/analyze', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          promptText: ytContextTitle
-            ? `${promptText}\nYouTube Reference Title: ${ytContextTitle}`
-            : promptText,
-          youtubeUrl: youtubeUrl.trim(),
-          channelId: channelId.trim(),
-          duration: targetDuration,
-          frames: keyframes.map((k) => k.dataUrl),
-          aspectMode
-        })
-      });
+      }>(
+        '/api/analyze',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            promptText: ytContextTitle
+              ? `${promptText}\nYouTube Reference Title: ${ytContextTitle}`
+              : promptText,
+            youtubeUrl: youtubeUrl.trim(),
+            channelId: channelId.trim(),
+            duration: targetDuration,
+            frames: keyframes.map((k) => k.dataUrl),
+            aspectMode
+          })
+        },
+        (msg) => setLiveProgressText(msg)
+      );
+
+      if (data.modelUsed) {
+        setLastModelUsed(data.modelUsed);
+      }
 
       if (!Array.isArray(data.shots) || data.shots.length === 0) {
         throw new ApiRequestError(
@@ -514,7 +632,7 @@ export default function App() {
           continue;
         }
         existingNames.add(uc.name.trim().toLowerCase());
-        showNotice(`Generating cutout sheet for "${uc.name}"...`);
+        setLiveProgressText(`Generating cutout sheet for "${uc.name}"...`);
         const ok = await handleGenerateGeminiSheet(uc.name, uc.description, true);
         if (!ok) failedChars.push(uc.name);
       }
@@ -523,24 +641,31 @@ export default function App() {
       if (failedChars.length > 0) {
         showNotice(
           `Generated ${data.shots.length}-scene storyboard (${maxEnd.toFixed(1)}s${modelInfo}), but character sheet generation failed for: ${failedChars.join(', ')}. You can retry them in Cutout Rig.`,
-          'error'
+          'error',
+          undefined,
+          originTab
         );
       } else {
         showNotice(
-          `Generated ${data.shots.length}-scene 3D storyboard (${maxEnd.toFixed(1)}s${modelInfo}) in channel ${channelId} style.`
+          `Generated ${data.shots.length}-scene 3D storyboard (${maxEnd.toFixed(1)}s${modelInfo}) in channel ${channelId} style.`,
+          'info',
+          undefined,
+          originTab
         );
       }
     } catch (err: unknown) {
-      const retryable = err instanceof ApiRequestError ? err.retryable : true;
+      const retryable = err instanceof ApiRequestError ? err.retryable : false;
       const msg =
         err instanceof Error ? err.message : 'Storyboard generation failed.';
       showNotice(
-        `${msg} (Active timeline remained "${timelineSource.label}" — click Retry Analysis to regenerate.)`,
+        `${msg} (Active timeline remained "${timelineSource.label}".)`,
         'error',
-        retryable
+        retryable ? 'analyze' : undefined,
+        originTab
       );
     } finally {
       setIsAnalyzing(false);
+      setLiveProgressText(null);
     }
   };
 
@@ -579,6 +704,8 @@ export default function App() {
   };
 
   const handleUploadCustomSheet = async (charName: string, dataUrl: string) => {
+    const originTab = activeTabRef.current;
+    setStatusNotice(null);
     setIsCharBusy(true);
     try {
       knownLayoutsRef.current.delete(charName);
@@ -595,7 +722,10 @@ export default function App() {
         )
       );
       showNotice(
-        `Segmented ${pieces.length} pieces from custom #FF00FF sheet for ${charName}. Click AI Auto-Label Limbs if any roles need adjustment.`
+        `Segmented ${pieces.length} pieces from custom #FF00FF sheet for ${charName}. Click AI Auto-Label Limbs if any roles need adjustment.`,
+        'info',
+        undefined,
+        originTab
       );
     } finally {
       setIsCharBusy(false);
@@ -605,20 +735,33 @@ export default function App() {
   const handleAutoLabelPieces = async (charName: string) => {
     const target = characters.find((c) => c.name === charName);
     if (!target || target.pieces.length === 0) return;
+    const originTab = activeTabRef.current;
+    lastAutoLabelCharRef.current = charName;
+    setStatusNotice(null);
+    setLiveProgressText(null);
     setIsCharBusy(true);
     try {
       const data = await safeFetchJson<{
+        modelUsed?: string;
         assignments?: Array<{ id: string; role: string }>;
-      }>('/api/auto-label-parts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          pieces: target.pieces.map((p) => ({
-            id: p.id,
-            imageDataUrl: p.imageDataUrl
-          }))
-        })
-      });
+      }>(
+        '/api/auto-label-parts',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            pieces: target.pieces.map((p) => ({
+              id: p.id,
+              imageDataUrl: p.imageDataUrl
+            }))
+          })
+        },
+        (msg) => setLiveProgressText(msg)
+      );
+
+      if (data.modelUsed) {
+        setLastModelUsed(data.modelUsed);
+      }
 
       const map = new Map<string, PieceRole>();
       for (const item of data.assignments || []) {
@@ -638,14 +781,24 @@ export default function App() {
             : ch
         )
       );
-      showNotice(`AI Vision labeled ${map.size} cutout limbs for ${charName}.`);
+      const modelInfo = data.modelUsed ? ` via ${data.modelUsed}` : '';
+      showNotice(
+        `AI Vision labeled ${map.size} cutout limbs for ${charName}${modelInfo}.`,
+        'info',
+        undefined,
+        originTab
+      );
     } catch (err: unknown) {
+      const retryable = err instanceof ApiRequestError ? err.retryable : false;
       showNotice(
         err instanceof Error ? err.message : 'Auto-label request failed.',
-        'error'
+        'error',
+        retryable ? 'auto-label' : undefined,
+        originTab
       );
     } finally {
       setIsCharBusy(false);
+      setLiveProgressText(null);
     }
   };
 
@@ -654,19 +807,34 @@ export default function App() {
     description: string,
     silentError = false
   ): Promise<boolean> => {
+    const originTab = activeTabRef.current;
+    lastGenSheetParamsRef.current = { name: charName, description };
+    if (!silentError) {
+      setStatusNotice(null);
+    }
+    setLiveProgressText(null);
     setIsCharBusy(true);
     try {
       const data = await safeFetchJson<{
+        modelUsed?: string;
         partsSvgMap?: Partial<Record<PieceRole, string>>;
-      }>('/api/generate-character-sheet', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          characterName: charName,
-          description,
-          referenceFrameDataUrl: keyframes[0]?.dataUrl
-        })
-      });
+      }>(
+        '/api/generate-character-sheet',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            characterName: charName,
+            description,
+            referenceFrameDataUrl: keyframes[0]?.dataUrl
+          })
+        },
+        (msg) => setLiveProgressText(msg)
+      );
+
+      if (data.modelUsed) {
+        setLastModelUsed(data.modelUsed);
+      }
 
       const { sheetDataUrl, knownBoxes } = await renderSvgPartsToSheet(
         data.partsSvgMap || {}
@@ -694,19 +862,29 @@ export default function App() {
       });
       setActiveCharName(charName);
       if (!silentError) {
-        showNotice(`Generated rigged paper-cutout sheet for ${charName} (${pieces.length} parts).`);
+        const modelInfo = data.modelUsed ? ` via ${data.modelUsed}` : '';
+        showNotice(
+          `Generated rigged paper-cutout sheet for ${charName} (${pieces.length} parts${modelInfo}).`,
+          'info',
+          undefined,
+          originTab
+        );
       }
       return true;
     } catch (err: unknown) {
       if (!silentError) {
+        const retryable = err instanceof ApiRequestError ? err.retryable : false;
         showNotice(
           err instanceof Error ? err.message : 'Character sheet generation failed.',
-          'error'
+          'error',
+          retryable ? 'generate-sheet' : undefined,
+          originTab
         );
       }
       return false;
     } finally {
       setIsCharBusy(false);
+      setLiveProgressText(null);
     }
   };
 
@@ -716,26 +894,48 @@ export default function App() {
       .filter(Boolean)
       .join(' ');
     if (!narration) return;
+    const originTab = activeTabRef.current;
+    lastTtsVoiceRef.current = voiceName;
+    setStatusNotice(null);
+    setLiveProgressText(null);
     setIsGeneratingTts(true);
     try {
-      const data = await safeFetchJson<{ audioDataUrl: string }>('/api/tts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: narration, voiceName })
-      });
+      const data = await safeFetchJson<{ audioDataUrl: string; modelUsed?: string }>(
+        '/api/tts',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: narration, voiceName })
+        },
+        (msg) => setLiveProgressText(msg)
+      );
+      if (data.modelUsed) {
+        setLastModelUsed(data.modelUsed);
+      }
       setAudioDataUrl(data.audioDataUrl);
-      showNotice('Voiceover WAV generated and synced to stage playback.');
+      const modelInfo = data.modelUsed ? ` via ${data.modelUsed}` : '';
+      showNotice(
+        `Voiceover WAV generated${modelInfo} and synced to stage playback.`,
+        'info',
+        undefined,
+        originTab
+      );
     } catch (err: unknown) {
+      const retryable = err instanceof ApiRequestError ? err.retryable : false;
       showNotice(
         err instanceof Error ? err.message : 'TTS generation failed.',
-        'error'
+        'error',
+        retryable ? 'tts' : undefined,
+        originTab
       );
     } finally {
       setIsGeneratingTts(false);
+      setLiveProgressText(null);
     }
   };
 
   const handleSaveFramePng = () => {
+    setStatusNotice(null);
     const canvas = canvasRef.current;
     const engine = engineRef.current;
     if (!canvas || !engine) return;
@@ -749,6 +949,8 @@ export default function App() {
   const handleExportMp4 = async () => {
     const engine = engineRef.current;
     if (!engine) return;
+    const originTab = activeTabRef.current;
+    setStatusNotice(null);
     setIsPlaying(false);
     setIsExporting(true);
     setExportResult(null);
@@ -769,13 +971,20 @@ export default function App() {
       a.href = result.blobUrl;
       a.download = result.filename;
       a.click();
-      showNotice(`Exported ${result.filename} (${result.totalFrames} frames).`);
+      showNotice(
+        `Exported ${result.filename} (${result.totalFrames} frames).`,
+        'info',
+        undefined,
+        originTab
+      );
     } catch (err: unknown) {
+      setActiveTab('export');
       showNotice(
         err instanceof Error ? err.message : 'MP4 export failed.',
-        'error'
+        'error',
+        undefined,
+        'export'
       );
-      setActiveTab('export');
     } finally {
       setIsExporting(false);
       // Restore preview frame
@@ -797,16 +1006,25 @@ export default function App() {
     <div className="min-h-screen flex flex-col bg-[#0d0f14] text-slate-100">
       <TopBar
         activeTab={activeTab}
-        onSelectTab={setActiveTab}
+        onSelectTab={handleSelectTab}
         onQuickExport={handleExportMp4}
         isExporting={isExporting}
+        modelUsed={lastModelUsed}
       />
 
       {audioDataUrl && (
         <audio ref={audioRef} src={audioDataUrl} className="hidden" />
       )}
 
-      {statusNotice && (
+      {liveProgressText && (
+        <div className="mx-auto max-w-[1440px] w-full px-6 pt-4">
+          <div className="flex items-center justify-between gap-4 rounded-xl border border-amber-700/60 bg-amber-950/30 px-4 py-2 text-xs text-amber-200 font-mono">
+            <span>{liveProgressText}</span>
+          </div>
+        </div>
+      )}
+
+      {statusNotice && statusNotice.tab === activeTab && (
         <div className="mx-auto max-w-[1440px] w-full px-6 pt-4">
           <div
             className={`flex flex-wrap items-center justify-between gap-4 rounded-xl border px-4 py-2.5 text-xs ${
@@ -817,14 +1035,29 @@ export default function App() {
           >
             <span className="flex-1 min-w-[220px]">{statusNotice.text}</span>
             <div className="flex items-center gap-2 shrink-0">
-              {statusNotice.canRetryAnalyze && (
+              {statusNotice.type === 'error' && statusNotice.retryAction && (
                 <button
                   type="button"
-                  disabled={isAnalyzing}
-                  onClick={handleGenerateStoryboard}
+                  disabled={isAnalyzing || isCharBusy || isGeneratingTts}
+                  onClick={() => {
+                    const action = statusNotice.retryAction;
+                    if (action === 'analyze') {
+                      handleGenerateStoryboard();
+                    } else if (action === 'tts') {
+                      handleGenerateTts(lastTtsVoiceRef.current);
+                    } else if (action === 'auto-label') {
+                      handleAutoLabelPieces(lastAutoLabelCharRef.current);
+                    } else if (action === 'generate-sheet' && lastGenSheetParamsRef.current) {
+                      handleGenerateGeminiSheet(
+                        lastGenSheetParamsRef.current.name,
+                        lastGenSheetParamsRef.current.description,
+                        false
+                      );
+                    }
+                  }}
                   className="px-3 py-1 rounded-md bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-semibold cursor-pointer"
                 >
-                  {isAnalyzing ? 'Retrying...' : 'Retry Analysis'}
+                  Retry
                 </button>
               )}
               <button
@@ -1015,7 +1248,7 @@ export default function App() {
                   >
                     <Sparkles className="w-4 h-4" />
                     {isAnalyzing
-                      ? 'Analyzing Frames & Building 3D Scenes...'
+                      ? liveProgressText || 'Analyzing Frames & Building 3D Scenes...'
                       : 'Generate 3D Storyboard & Animation'}
                   </button>
                 </div>
@@ -1240,6 +1473,7 @@ export default function App() {
             }}
             onAutoLabelPieces={handleAutoLabelPieces}
             isBusy={isCharBusy}
+            liveProgressText={liveProgressText}
           />
         )}
 
@@ -1259,13 +1493,14 @@ export default function App() {
             exportResult={exportResult}
             isExporting={isExporting}
             isGeneratingTts={isGeneratingTts}
+            liveProgressText={liveProgressText}
             onChangeAspect={setAspectMode}
             onChangeTimeline={setTimelineConfig}
             onGenerateTts={handleGenerateTts}
             onUploadAudio={setAudioDataUrl}
             onRunExportMp4={handleExportMp4}
             onSaveFramePng={handleSaveFramePng}
-            onGoToStage={() => setActiveTab('stage')}
+            onGoToStage={() => handleSelectTab('stage')}
           />
         )}
       </main>

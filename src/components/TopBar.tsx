@@ -7,6 +7,7 @@ interface TopBarProps {
   onSelectTab: (tab: WorkspaceTab) => void;
   onQuickExport: () => void;
   isExporting: boolean;
+  modelUsed?: string | null;
 }
 
 const NAV_ITEMS: Array<{ id: WorkspaceTab; label: string }> = [
@@ -20,7 +21,8 @@ export const TopBar: React.FC<TopBarProps> = ({
   activeTab,
   onSelectTab,
   onQuickExport,
-  isExporting
+  isExporting,
+  modelUsed
 }) => {
   return (
     <header className="border-b border-slate-800/90 bg-[#0d0f14] px-6 py-3.5">
@@ -53,7 +55,15 @@ export const TopBar: React.FC<TopBarProps> = ({
           })}
         </nav>
 
-        <div className="shrink-0">
+        <div className="flex items-center gap-3 shrink-0">
+          {modelUsed && (
+            <span
+              title="Last Gemini model that answered"
+              className="hidden md:inline-block font-mono text-[11px] text-slate-400 border border-slate-800 bg-[#141822] px-2.5 py-1 rounded-md"
+            >
+              Model: {modelUsed}
+            </span>
+          )}
           <button
             type="button"
             onClick={onQuickExport}

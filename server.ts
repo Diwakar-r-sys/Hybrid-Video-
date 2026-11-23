@@ -10,6 +10,47 @@ dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+function parseEnvModelList(
+  listEnv: string | undefined,
+  singleEnv: string | undefined,
+  defaults: string[]
+): string[] {
+  const combined = listEnv || singleEnv;
+  if (!combined || !combined.trim()) return defaults;
+  return combined
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+export const MODEL_CONFIG = {
+  TEXT_MODELS: parseEnvModelList(
+    process.env.GEMINI_TEXT_MODELS,
+    process.env.GEMINI_TEXT_MODEL,
+    [
+      'gemini-3.1-flash-lite',
+      'gemini-4-hydrogen',
+      'gemini-3.8-flash',
+      'gemini-3.6-flash',
+      'gemini-3.5-flash-lite'
+    ]
+  ),
+  IMAGE_MODELS: parseEnvModelList(
+    process.env.GEMINI_IMAGE_MODELS,
+    process.env.GEMINI_IMAGE_MODEL,
+    ['gemini-3.1-flash-lite-image', 'gemini-3.1-flash-image']
+  ),
+  TTS_MODELS: parseEnvModelList(
+    process.env.GEMINI_TTS_MODELS,
+    process.env.GEMINI_TTS_MODEL,
+    ['gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts']
+  )
+};
+
+const RETRY_BACKOFF_MS = [2000, 5000, 10000, 20000];
+const MAX_TOTAL_WAIT_MS = 60_000;
+const ATTEMPTS_PER_MODEL = 2;
+
 const app = express();
 app.use(express.json({ limit: '35mb' }));
 
@@ -35,7 +76,7 @@ interface RetryableError extends Error {
   code?: number;
 }
 
-function extractApiErrorInfo(err: unknown): {
+function extractApiErrorInfo(err: unknown, attemptedModel?: string): {
   status: number;
   message: string;
   retryable: boolean;
@@ -44,7 +85,6 @@ function extractApiErrorInfo(err: unknown): {
   let status = (err as RetryableError)?.status || (err as RetryableError)?.code || 500;
   let cleanMessage = rawMsg;
 
-  // Handle nested JSON string inside @google/genai Error.message
   const jsonStart = rawMsg.indexOf('{');
   if (jsonStart !== -1) {
     try {
@@ -60,34 +100,104 @@ function extractApiErrorInfo(err: unknown): {
     }
   }
 
+  const numericStatus = typeof status === 'number' ? status : 500;
+
+  if (numericStatus === 404 || /NOT_FOUND/i.test(rawMsg)) {
+    return {
+      status: 404,
+      message: attemptedModel
+        ? `model not found: ${attemptedModel} (${cleanMessage})`
+        : `model not found: ${cleanMessage}`,
+      retryable: false
+    };
+  }
+
+  if (
+    numericStatus === 400 ||
+    numericStatus === 401 ||
+    numericStatus === 403 ||
+    /API_KEY_INVALID|PERMISSION_DENIED/i.test(rawMsg)
+  ) {
+    return {
+      status: numericStatus,
+      message: cleanMessage,
+      retryable: false
+    };
+  }
+
   const retryable =
-    status === 503 ||
-    status === 429 ||
-    status === 502 ||
-    status === 504 ||
+    numericStatus === 503 ||
+    numericStatus === 429 ||
+    numericStatus === 502 ||
+    numericStatus === 504 ||
     /503|429|UNAVAILABLE|high demand|overloaded|RESOURCE_EXHAUSTED|timeout|ECONNRESET/i.test(
       rawMsg
     );
 
-  return { status: typeof status === 'number' ? status : 500, message: cleanMessage, retryable };
+  return { status: numericStatus, message: cleanMessage, retryable };
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+interface SseResponder {
+  isStream: boolean;
+  sendProgress: (message: string) => void;
+  sendJson: (status: number, body: Record<string, unknown>) => void;
+}
+
+function createResponder(req: express.Request, res: express.Response): SseResponder {
+  const wantsStream =
+    Boolean(req.headers.accept?.includes('text/event-stream')) ||
+    req.query.stream === '1';
+
+  if (wantsStream) {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+  }
+
+  return {
+    isStream: wantsStream,
+    sendProgress: (message: string) => {
+      if (wantsStream && !res.writableEnded) {
+        res.write(`data: ${JSON.stringify({ type: 'progress', message })}\n\n`);
+      }
+    },
+    sendJson: (status: number, body: Record<string, unknown>) => {
+      if (wantsStream) {
+        if (!res.writableEnded) {
+          const eventType = status >= 400 ? 'error' : 'result';
+          res.write(`data: ${JSON.stringify({ type: eventType, status, ...body })}\n\n`);
+          res.end();
+        }
+      } else {
+        res.status(status).json(body);
+      }
+    }
+  };
+}
+
 async function generateWithRetry(
   ai: GoogleGenAI,
   params: Omit<Parameters<GoogleGenAI['models']['generateContent']>[0], 'model'>,
-  modelsOrder: string[] = ['gemini-4-hydrogen', 'gemini-3.1-flash-lite']
+  modelsOrder: string[],
+  onProgress?: (msg: string) => void
 ) {
   let lastError: unknown;
+  let lastModel = modelsOrder[0] || '';
+  let retryCount = 0;
+  let totalWaitMs = 0;
+
+  const maxPossibleRetries = modelsOrder.length * ATTEMPTS_PER_MODEL - 1;
 
   for (let mIdx = 0; mIdx < modelsOrder.length; mIdx++) {
     const model = modelsOrder[mIdx];
-    const maxAttempts = mIdx === 0 ? 3 : 2;
+    lastModel = model;
 
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    for (let attempt = 1; attempt <= ATTEMPTS_PER_MODEL; attempt++) {
       try {
         const result = await ai.models.generateContent({
           ...params,
@@ -96,29 +206,86 @@ async function generateWithRetry(
         return { result, modelUsed: model };
       } catch (err: unknown) {
         lastError = err;
-        const info = extractApiErrorInfo(err);
+        const info = extractApiErrorInfo(err, model);
         console.warn(
-          `[Gemini] ${model} attempt ${attempt}/${maxAttempts} failed (${info.status}): ${info.message}`
+          `[Gemini] ${model} attempt ${attempt}/${ATTEMPTS_PER_MODEL} failed (${info.status}): ${info.message}`
         );
+
+        // Non-retryable errors (400, 401, 403, 404) fail immediately
         if (!info.retryable) {
-          throw err;
+          const wrapped = new Error(info.message) as RetryableError;
+          wrapped.status = info.status;
+          throw wrapped;
         }
-        if (attempt < maxAttempts) {
-          const jitter = Math.floor(Math.random() * 350);
-          await sleep(800 * attempt + jitter);
+
+        const hasMoreAttempts =
+          attempt < ATTEMPTS_PER_MODEL || mIdx < modelsOrder.length - 1;
+        if (!hasMoreAttempts) {
+          break;
         }
+
+        const baseDelay =
+          RETRY_BACKOFF_MS[Math.min(retryCount, RETRY_BACKOFF_MS.length - 1)];
+        const jitter = Math.floor(Math.random() * 450);
+        const remainingBudget = MAX_TOTAL_WAIT_MS - totalWaitMs;
+        const delayMs = Math.min(baseDelay + jitter, remainingBudget);
+
+        if (delayMs <= 0) {
+          break;
+        }
+
+        retryCount++;
+        totalWaitMs += delayMs;
+        const delaySec = Math.max(1, Math.round(delayMs / 1000));
+        const nextModel =
+          attempt < ATTEMPTS_PER_MODEL ? model : modelsOrder[mIdx + 1];
+        onProgress?.(
+          `Gemini is busy (${model}), retry ${retryCount}/${Math.min(4, maxPossibleRetries)} in ${delaySec}s (next: ${nextModel})`
+        );
+        await sleep(delayMs);
       }
     }
   }
 
-  throw lastError;
+  const finalInfo = extractApiErrorInfo(lastError, lastModel);
+  const finalErr = new Error(finalInfo.message) as RetryableError;
+  finalErr.status = finalInfo.status;
+  throw finalErr;
 }
 
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
-    hasApiKey: Boolean(process.env.GEMINI_API_KEY)
+    hasApiKey: Boolean(process.env.GEMINI_API_KEY),
+    models: MODEL_CONFIG
   });
+});
+
+app.get('/api/models', async (_req, res) => {
+  try {
+    const ai = getGeminiClient();
+    const pager = await ai.models.list();
+    const available: Array<{ name: string; displayName?: string }> = [];
+    for await (const m of pager) {
+      available.push({
+        name: (m.name || '').replace(/^models\//, ''),
+        displayName: m.displayName
+      });
+    }
+    res.json({
+      ok: true,
+      configured: MODEL_CONFIG,
+      available
+    });
+  } catch (err: unknown) {
+    const info = extractApiErrorInfo(err);
+    res.status(info.status >= 400 && info.status < 600 ? info.status : 500).json({
+      ok: false,
+      error: info.message,
+      code: info.status,
+      configured: MODEL_CONFIG
+    });
+  }
 });
 
 app.post('/api/youtube-info', async (req, res) => {
@@ -163,6 +330,7 @@ app.post('/api/youtube-info', async (req, res) => {
 });
 
 app.post('/api/analyze', async (req, res) => {
+  const responder = createResponder(req, res);
   try {
     const ai = getGeminiClient();
     const {
@@ -183,7 +351,6 @@ app.post('/api/analyze', async (req, res) => {
 
     const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [];
 
-    // Attach up to 10 representative video frames to keep payload fast & reliable on long timelines
     for (const frameUrl of frames.slice(0, 10)) {
       const match = /^data:(image\/[a-zA-Z0-9+.-]+);base64,(.+)$/.exec(frameUrl);
       if (match) {
@@ -336,24 +503,27 @@ Ensure shots are contiguous from 0.0 to ${duration}, with ${shotTargetCount} dis
           }
         }
       },
-      ['gemini-4-hydrogen', 'gemini-3.1-flash-lite']
+      MODEL_CONFIG.TEXT_MODELS,
+      responder.sendProgress
     );
 
     const jsonStr = (response.text ?? '{}').trim();
     const parsed = JSON.parse(jsonStr);
-    res.json({ ...parsed, modelUsed });
+    responder.sendJson(200, { ...parsed, modelUsed });
   } catch (err: unknown) {
     const info = extractApiErrorInfo(err);
     console.error('Analyze error:', err);
-    res.status(info.status >= 400 && info.status < 600 ? info.status : 500).json({
+    const code = info.status >= 400 && info.status < 600 ? info.status : 500;
+    responder.sendJson(code, {
       error: info.message,
-      code: info.status,
+      code,
       retryable: info.retryable
     });
   }
 });
 
 app.post('/api/generate-character-sheet', async (req, res) => {
+  const responder = createResponder(req, res);
   try {
     const ai = getGeminiClient();
     const {
@@ -414,30 +584,33 @@ Rules for every SVG part:
           }
         }
       },
-      ['gemini-4-hydrogen', 'gemini-3.1-flash-lite']
+      MODEL_CONFIG.TEXT_MODELS,
+      responder.sendProgress
     );
 
     const parsed = JSON.parse((response.text ?? '{}').trim());
-    res.json({ partsSvgMap: parsed, modelUsed });
+    responder.sendJson(200, { partsSvgMap: parsed, modelUsed });
   } catch (err: unknown) {
     const info = extractApiErrorInfo(err);
     console.error('Character sheet error:', err);
-    res.status(info.status >= 400 && info.status < 600 ? info.status : 500).json({
+    const code = info.status >= 400 && info.status < 600 ? info.status : 500;
+    responder.sendJson(code, {
       error: info.message,
-      code: info.status,
+      code,
       retryable: info.retryable
     });
   }
 });
 
 app.post('/api/auto-label-parts', async (req, res) => {
+  const responder = createResponder(req, res);
   try {
     const ai = getGeminiClient();
     const { pieces } = req.body as {
       pieces: Array<{ id: string; imageDataUrl: string }>;
     };
     if (!pieces || pieces.length === 0) {
-      res.status(400).json({ error: 'No pieces provided for labeling', retryable: false });
+      responder.sendJson(400, { error: 'No pieces provided for labeling', retryable: false });
       return;
     }
 
@@ -474,23 +647,26 @@ app.post('/api/auto-label-parts', async (req, res) => {
           }
         }
       },
-      ['gemini-4-hydrogen', 'gemini-3.1-flash-lite']
+      MODEL_CONFIG.TEXT_MODELS,
+      responder.sendProgress
     );
 
     const assignments = JSON.parse((response.text ?? '[]').trim());
-    res.json({ assignments, modelUsed });
+    responder.sendJson(200, { assignments, modelUsed });
   } catch (err: unknown) {
     const info = extractApiErrorInfo(err);
     console.error('Auto-label error:', err);
-    res.status(info.status >= 400 && info.status < 600 ? info.status : 500).json({
+    const code = info.status >= 400 && info.status < 600 ? info.status : 500;
+    responder.sendJson(code, {
       error: info.message,
-      code: info.status,
+      code,
       retryable: info.retryable
     });
   }
 });
 
 app.post('/api/tts', async (req, res) => {
+  const responder = createResponder(req, res);
   try {
     const ai = getGeminiClient();
     const { text, voiceName = 'Kore', style = 'Expressive storybook narrator' } = req.body as {
@@ -499,11 +675,11 @@ app.post('/api/tts', async (req, res) => {
       style?: string;
     };
     if (!text || !text.trim()) {
-      res.status(400).json({ error: 'Narration text is required', retryable: false });
+      responder.sendJson(400, { error: 'Narration text is required', retryable: false });
       return;
     }
 
-    const { result: response } = await generateWithRetry(
+    const { result: response, modelUsed } = await generateWithRetry(
       ai,
       {
         contents: [
@@ -526,25 +702,28 @@ app.post('/api/tts', async (req, res) => {
           }
         }
       },
-      ['gemini-3.8-flash-lite-tts']
+      MODEL_CONFIG.TTS_MODELS,
+      responder.sendProgress
     );
 
     const base64Audio =
       response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
     if (!base64Audio) {
-      res.status(502).json({ error: 'No audio returned by TTS model', retryable: true });
+      responder.sendJson(502, { error: 'No audio returned by TTS model', retryable: true });
       return;
     }
 
-    res.json({
-      audioDataUrl: `data:audio/wav;base64,${base64Audio}`
+    responder.sendJson(200, {
+      audioDataUrl: `data:audio/wav;base64,${base64Audio}`,
+      modelUsed
     });
   } catch (err: unknown) {
     const info = extractApiErrorInfo(err);
     console.error('TTS error:', err);
-    res.status(info.status >= 400 && info.status < 600 ? info.status : 500).json({
+    const code = info.status >= 400 && info.status < 600 ? info.status : 500;
+    responder.sendJson(code, {
       error: info.message,
-      code: info.status,
+      code,
       retryable: info.retryable
     });
   }
@@ -572,16 +751,20 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.resolve(__dirname, 'dist');
-    if (fs.existsSync(distPath)) {
-      app.use(express.static(distPath));
-      app.get('/{*splat}', (_req, res) => {
-        res.sendFile(path.join(distPath, 'index.html'));
-      });
+    const distIndex = path.join(distPath, 'index.html');
+    if (!fs.existsSync(distPath) || !fs.existsSync(distIndex)) {
+      throw new Error(
+        `Production build missing: ${distIndex} not found. Run "npm run build" before starting in production mode.`
+      );
     }
+    app.use(express.static(distPath));
+    app.get('*', (_req, res) => {
+      res.sendFile(distIndex);
+    });
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`CutoutStage 3D studio listening on http://localhost:${PORT}`);
+    console.log(`CutoutStage 3D studio listening on http://localhost:${PORT} (${process.env.NODE_ENV || 'development'})`);
   });
 }
 

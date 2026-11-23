@@ -14,6 +14,7 @@ interface ExportStudioProps {
   exportResult: ExportResult | null;
   isExporting: boolean;
   isGeneratingTts: boolean;
+  liveProgressText?: string | null;
   onChangeAspect: (mode: AspectMode) => void;
   onChangeTimeline: (updater: (cfg: TimelineConfig) => TimelineConfig) => void;
   onGenerateTts: (voiceName: string) => Promise<void>;
@@ -36,6 +37,7 @@ export const ExportStudio: React.FC<ExportStudioProps> = ({
   exportResult,
   isExporting,
   isGeneratingTts,
+  liveProgressText,
   onChangeAspect,
   onChangeTimeline,
   onGenerateTts,
@@ -253,7 +255,9 @@ export const ExportStudio: React.FC<ExportStudioProps> = ({
               className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 text-xs font-semibold cursor-pointer whitespace-nowrap"
             >
               <Mic className="w-3.5 h-3.5" />
-              {isGeneratingTts ? 'Synthesizing...' : 'Generate AI Voiceover'}
+              {isGeneratingTts
+                ? liveProgressText || 'Synthesizing...'
+                : 'Generate AI Voiceover'}
             </button>
 
             <label className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium border border-slate-700 cursor-pointer whitespace-nowrap">
