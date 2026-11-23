@@ -145,7 +145,13 @@ async function safeFetchJson<T>(
               : typeof evt.code === 'number'
               ? evt.code
               : 500;
-            const msg = typeof evt.error === 'string' ? evt.error : `Server error ${code}`;
+            const baseMsg = typeof evt.error === 'string' ? evt.error : `Server error ${code}`;
+            const failed = Array.isArray(evt.failedModels)
+              ? (evt.failedModels as Array<{ model?: string; status?: number; reason?: string }>)
+                  .map((f) => `${f.model || 'model'} (${f.status ?? code}): ${f.reason || 'failed'}`)
+                  .join(' | ')
+              : '';
+            const msg = failed ? `${baseMsg} [Failed: ${failed}]` : baseMsg;
             const retryable = Boolean(evt.retryable) || code === 503 || code === 429;
             throw new ApiRequestError(msg, code, retryable);
           } else if (evt.type === 'result') {
@@ -197,10 +203,16 @@ async function safeFetchJson<T>(
   }
 
   if (!res.ok) {
-    const msg =
+    const baseMsg =
       typeof parsed.error === 'string'
         ? parsed.error
         : `Server error ${res.status}`;
+    const failed = Array.isArray(parsed.failedModels)
+      ? (parsed.failedModels as Array<{ model?: string; status?: number; reason?: string }>)
+          .map((f) => `${f.model || 'model'} (${f.status ?? res.status}): ${f.reason || 'failed'}`)
+          .join(' | ')
+      : '';
+    const msg = failed ? `${baseMsg} [Failed: ${failed}]` : baseMsg;
     throw new ApiRequestError(
       msg,
       typeof parsed.code === 'number' ? parsed.code : res.status,

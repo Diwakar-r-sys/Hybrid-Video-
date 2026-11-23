@@ -23,17 +23,22 @@ function parseEnvModelList(
     .filter(Boolean);
 }
 
+const HAS_CUSTOM_TEXT_MODELS = Boolean(
+  process.env.GEMINI_TEXT_MODELS?.trim() || process.env.GEMINI_TEXT_MODEL?.trim()
+);
+
+const DEFAULT_TEXT_MODELS = [
+  'gemini-3.1-flash-lite',
+  'gemini-3.8-flash',
+  'gemini-3.6-flash',
+  'gemini-3.5-flash-lite'
+];
+
 export const MODEL_CONFIG = {
   TEXT_MODELS: parseEnvModelList(
     process.env.GEMINI_TEXT_MODELS,
     process.env.GEMINI_TEXT_MODEL,
-    [
-      'gemini-3.1-flash-lite',
-      'gemini-4-hydrogen',
-      'gemini-3.8-flash',
-      'gemini-3.6-flash',
-      'gemini-3.5-flash-lite'
-    ]
+    DEFAULT_TEXT_MODELS
   ),
   IMAGE_MODELS: parseEnvModelList(
     process.env.GEMINI_IMAGE_MODELS,
@@ -46,6 +51,15 @@ export const MODEL_CONFIG = {
     ['gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts']
   )
 };
+
+function syncDiscoveredTextModels(availableNames: string[]): void {
+  if (HAS_CUSTOM_TEXT_MODELS) return;
+  const hasHydrogen = availableNames.includes('gemini-4-hydrogen');
+  const next = hasHydrogen
+    ? [...DEFAULT_TEXT_MODELS, 'gemini-4-hydrogen']
+    : [...DEFAULT_TEXT_MODELS];
+  MODEL_CONFIG.TEXT_MODELS.splice(0, MODEL_CONFIG.TEXT_MODELS.length, ...next);
+}
 
 const RETRY_BACKOFF_MS = [2000, 5000, 10000, 20000];
 const MAX_TOTAL_WAIT_MS = 60_000;
@@ -61,9 +75,11 @@ function getGeminiClient(): GoogleGenAI {
       'GEMINI_API_KEY is not configured. Add it in Settings > Secrets to run AI analysis and voice synthesis.'
     );
   }
+  const baseUrl = process.env.GOOGLE_GEMINI_BASE_URL?.trim();
   return new GoogleGenAI({
     apiKey,
     httpOptions: {
+      ...(baseUrl ? { baseUrl } : {}),
       headers: {
         'User-Agent': 'aistudio-build'
       }
@@ -71,17 +87,28 @@ function getGeminiClient(): GoogleGenAI {
   });
 }
 
+export interface ModelAttemptFailure {
+  model: string;
+  attempt: string;
+  status: number;
+  reason: string;
+}
+
 interface RetryableError extends Error {
   status?: number;
   code?: number;
+  retryable?: boolean;
+  failures?: ModelAttemptFailure[];
 }
 
 function extractApiErrorInfo(err: unknown, attemptedModel?: string): {
   status: number;
   message: string;
   retryable: boolean;
+  failures?: ModelAttemptFailure[];
 } {
   const rawMsg = err instanceof Error ? err.message : String(err || 'Unknown API error');
+  const existingFailures = (err as RetryableError)?.failures;
   let status = (err as RetryableError)?.status || (err as RetryableError)?.code || 500;
   let cleanMessage = rawMsg;
 
@@ -102,39 +129,53 @@ function extractApiErrorInfo(err: unknown, attemptedModel?: string): {
 
   const numericStatus = typeof status === 'number' ? status : 500;
 
+  if (numericStatus === 401 || /API_KEY_INVALID/i.test(rawMsg)) {
+    return {
+      status: 401,
+      message: cleanMessage,
+      retryable: false,
+      failures: existingFailures
+    };
+  }
+
   if (numericStatus === 404 || /NOT_FOUND/i.test(rawMsg)) {
     return {
       status: 404,
       message: attemptedModel
         ? `model not found: ${attemptedModel} (${cleanMessage})`
-        : `model not found: ${cleanMessage}`,
-      retryable: false
+        : cleanMessage,
+      retryable: false,
+      failures: existingFailures
     };
   }
 
-  if (
-    numericStatus === 400 ||
-    numericStatus === 401 ||
-    numericStatus === 403 ||
-    /API_KEY_INVALID|PERMISSION_DENIED/i.test(rawMsg)
-  ) {
+  if (numericStatus === 400 || numericStatus === 403 || /PERMISSION_DENIED/i.test(rawMsg)) {
     return {
       status: numericStatus,
       message: cleanMessage,
-      retryable: false
+      retryable: false,
+      failures: existingFailures
     };
   }
 
+  const explicitRetryable = (err as RetryableError)?.retryable;
   const retryable =
-    numericStatus === 503 ||
-    numericStatus === 429 ||
-    numericStatus === 502 ||
-    numericStatus === 504 ||
-    /503|429|UNAVAILABLE|high demand|overloaded|RESOURCE_EXHAUSTED|timeout|ECONNRESET/i.test(
-      rawMsg
-    );
+    typeof explicitRetryable === 'boolean'
+      ? explicitRetryable
+      : numericStatus === 503 ||
+        numericStatus === 429 ||
+        numericStatus === 502 ||
+        numericStatus === 504 ||
+        /503|429|UNAVAILABLE|high demand|overloaded|RESOURCE_EXHAUSTED|timeout|ECONNRESET|fetch failed/i.test(
+          rawMsg
+        );
 
-  return { status: numericStatus, message: cleanMessage, retryable };
+  return {
+    status: numericStatus,
+    message: cleanMessage,
+    retryable,
+    failures: existingFailures
+  };
 }
 
 function sleep(ms: number): Promise<void> {
@@ -180,85 +221,158 @@ function createResponder(req: express.Request, res: express.Response): SseRespon
   };
 }
 
-async function generateWithRetry(
+export async function generateWithRetry(
   ai: GoogleGenAI,
   params: Omit<Parameters<GoogleGenAI['models']['generateContent']>[0], 'model'>,
   modelsOrder: string[],
   onProgress?: (msg: string) => void
 ) {
+  const totalAttempts = Math.max(1, modelsOrder.length * ATTEMPTS_PER_MODEL);
+  let globalAttempt = 0;
+  let retryIndex = 0;
+  let totalWaitMs = 0;
+  let budgetExhausted = false;
+  const failures: ModelAttemptFailure[] = [];
   let lastError: unknown;
   let lastModel = modelsOrder[0] || '';
-  let retryCount = 0;
-  let totalWaitMs = 0;
+  let lastInfo: { status: number; message: string; retryable: boolean } = {
+    status: 500,
+    message: 'No models configured',
+    retryable: false
+  };
 
-  const maxPossibleRetries = modelsOrder.length * ATTEMPTS_PER_MODEL - 1;
-
-  for (let mIdx = 0; mIdx < modelsOrder.length; mIdx++) {
+  outer: for (let mIdx = 0; mIdx < modelsOrder.length; mIdx++) {
     const model = modelsOrder[mIdx];
     lastModel = model;
 
     for (let attempt = 1; attempt <= ATTEMPTS_PER_MODEL; attempt++) {
+      globalAttempt++;
       try {
         const result = await ai.models.generateContent({
           ...params,
           model
         });
-        return { result, modelUsed: model };
+        return { result, modelUsed: model, failures };
       } catch (err: unknown) {
         lastError = err;
         const info = extractApiErrorInfo(err, model);
+        lastInfo = info;
+        const attemptLabel = `${globalAttempt}/${totalAttempts}`;
+
+        failures.push({
+          model,
+          attempt: attemptLabel,
+          status: info.status,
+          reason: info.message
+        });
+
         console.warn(
-          `[Gemini] ${model} attempt ${attempt}/${ATTEMPTS_PER_MODEL} failed (${info.status}): ${info.message}`
+          `[Gemini] ${model} attempt ${attemptLabel} failed (${info.status}): ${info.message}`
         );
 
-        // Non-retryable errors (400, 401, 403, 404) fail immediately
-        if (!info.retryable) {
-          const wrapped = new Error(info.message) as RetryableError;
-          wrapped.status = info.status;
-          throw wrapped;
+        // Only 401 (bad API key) aborts at once
+        if (info.status === 401) {
+          const authErr = new Error(info.message) as RetryableError;
+          authErr.status = 401;
+          authErr.retryable = false;
+          authErr.failures = failures;
+          throw authErr;
+        }
+
+        // 404 / 400 / 403 for ONE model: skip immediately to the NEXT model (no wait)
+        if (info.status === 404 || info.status === 400 || info.status === 403) {
+          if (mIdx < modelsOrder.length - 1) {
+            onProgress?.(
+              `${model} failed (${info.status}, attempt ${attemptLabel}); skipping to ${modelsOrder[mIdx + 1]}`
+            );
+          }
+          break;
         }
 
         const hasMoreAttempts =
           attempt < ATTEMPTS_PER_MODEL || mIdx < modelsOrder.length - 1;
         if (!hasMoreAttempts) {
-          break;
+          break outer;
+        }
+
+        const remainingBudget = MAX_TOTAL_WAIT_MS - totalWaitMs;
+        if (remainingBudget <= 0) {
+          budgetExhausted = true;
+          console.warn(
+            `[Gemini] Wait budget (${MAX_TOTAL_WAIT_MS}ms) exhausted after attempt ${attemptLabel}; stopping.`
+          );
+          break outer;
         }
 
         const baseDelay =
-          RETRY_BACKOFF_MS[Math.min(retryCount, RETRY_BACKOFF_MS.length - 1)];
+          RETRY_BACKOFF_MS[Math.min(retryIndex, RETRY_BACKOFF_MS.length - 1)];
         const jitter = Math.floor(Math.random() * 450);
-        const remainingBudget = MAX_TOTAL_WAIT_MS - totalWaitMs;
         const delayMs = Math.min(baseDelay + jitter, remainingBudget);
 
         if (delayMs <= 0) {
-          break;
+          budgetExhausted = true;
+          break outer;
         }
 
-        retryCount++;
+        retryIndex++;
         totalWaitMs += delayMs;
         const delaySec = Math.max(1, Math.round(delayMs / 1000));
         const nextModel =
           attempt < ATTEMPTS_PER_MODEL ? model : modelsOrder[mIdx + 1];
         onProgress?.(
-          `Gemini is busy (${model}), retry ${retryCount}/${Math.min(4, maxPossibleRetries)} in ${delaySec}s (next: ${nextModel})`
+          `Gemini is busy (${model}), attempt ${attemptLabel} failed — waiting ${delaySec}s before ${nextModel}`
         );
         await sleep(delayMs);
       }
     }
   }
 
-  const finalInfo = extractApiErrorInfo(lastError, lastModel);
-  const finalErr = new Error(finalInfo.message) as RetryableError;
+  const finalInfo = lastError ? extractApiErrorInfo(lastError, lastModel) : lastInfo;
+  const anyTransient = failures.some(
+    (f) => f.status === 503 || f.status === 429 || f.status === 502 || f.status === 504 || f.status >= 500
+  );
+  const message = budgetExhausted
+    ? `Retry wait budget (${Math.round(MAX_TOTAL_WAIT_MS / 1000)}s) exhausted; last error: ${finalInfo.message}`
+    : finalInfo.message;
+  const finalErr = new Error(message) as RetryableError;
   finalErr.status = finalInfo.status;
+  finalErr.retryable = finalInfo.status !== 401 && anyTransient;
+  finalErr.failures = failures;
   throw finalErr;
 }
 
-app.get('/api/health', (_req, res) => {
-  res.json({
-    ok: true,
-    hasApiKey: Boolean(process.env.GEMINI_API_KEY),
-    models: MODEL_CONFIG
-  });
+app.get('/api/health', async (_req, res) => {
+  if (!process.env.GEMINI_API_KEY) {
+    res.json({
+      ok: true,
+      hasApiKey: false,
+      models: MODEL_CONFIG
+    });
+    return;
+  }
+
+  try {
+    const ai = getGeminiClient();
+    const pager = await ai.models.list();
+    const names: string[] = [];
+    for await (const m of pager) {
+      if (m.name) names.push(m.name.replace(/^models\//, ''));
+    }
+    syncDiscoveredTextModels(names);
+    res.json({
+      ok: true,
+      hasApiKey: true,
+      models: MODEL_CONFIG
+    });
+  } catch (err: unknown) {
+    const info = extractApiErrorInfo(err);
+    res.json({
+      ok: true,
+      hasApiKey: false,
+      apiKeyError: info.message,
+      models: MODEL_CONFIG
+    });
+  }
 });
 
 app.get('/api/models', async (_req, res) => {
@@ -272,6 +386,7 @@ app.get('/api/models', async (_req, res) => {
         displayName: m.displayName
       });
     }
+    syncDiscoveredTextModels(available.map((m) => m.name));
     res.json({
       ok: true,
       configured: MODEL_CONFIG,
@@ -517,7 +632,8 @@ Ensure shots are contiguous from 0.0 to ${duration}, with ${shotTargetCount} dis
     responder.sendJson(code, {
       error: info.message,
       code,
-      retryable: info.retryable
+      retryable: info.retryable,
+      ...(info.failures ? { failedModels: info.failures } : {})
     });
   }
 });
@@ -597,7 +713,8 @@ Rules for every SVG part:
     responder.sendJson(code, {
       error: info.message,
       code,
-      retryable: info.retryable
+      retryable: info.retryable,
+      ...(info.failures ? { failedModels: info.failures } : {})
     });
   }
 });
@@ -660,7 +777,8 @@ app.post('/api/auto-label-parts', async (req, res) => {
     responder.sendJson(code, {
       error: info.message,
       code,
-      retryable: info.retryable
+      retryable: info.retryable,
+      ...(info.failures ? { failedModels: info.failures } : {})
     });
   }
 });
@@ -724,9 +842,19 @@ app.post('/api/tts', async (req, res) => {
     responder.sendJson(code, {
       error: info.message,
       code,
-      retryable: info.retryable
+      retryable: info.retryable,
+      ...(info.failures ? { failedModels: info.failures } : {})
     });
   }
+});
+
+// Return JSON 404 for unknown /api/* routes before SPA fallback
+app.use('/api', (req, res) => {
+  res.status(404).json({
+    error: `API route not found: ${req.method} ${req.originalUrl}`,
+    code: 404,
+    retryable: false
+  });
 });
 
 // Ensure /api/* errors always return JSON instead of HTML error pages
@@ -735,7 +863,8 @@ app.use('/api', (err: unknown, _req: express.Request, res: express.Response, _ne
   res.status(info.status >= 400 && info.status < 600 ? info.status : 500).json({
     error: info.message,
     code: info.status,
-    retryable: info.retryable
+    retryable: info.retryable,
+    ...(info.failures ? { failedModels: info.failures } : {})
   });
 });
 
