@@ -21,6 +21,7 @@ interface CharacterStudioProps {
   onAutoLabelPieces: (charName: string) => Promise<void>;
   isBusy: boolean;
   liveProgressText?: string | null;
+  imageModelsEmpty?: boolean;
 }
 
 const PIECE_ROLES: PieceRole[] = [
@@ -51,7 +52,8 @@ export const CharacterStudio: React.FC<CharacterStudioProps> = ({
   onGenerateGeminiSheet,
   onAutoLabelPieces,
   isBusy,
-  liveProgressText
+  liveProgressText,
+  imageModelsEmpty = false
 }) => {
   const activeChar =
     characters.find((c) => c.name === activeCharacterName) || characters[0];
@@ -206,6 +208,11 @@ export const CharacterStudio: React.FC<CharacterStudioProps> = ({
             <div className="text-xs font-semibold text-slate-200">
               Generate Custom Paper-Cutout Character Rig (Gemini)
             </div>
+            {imageModelsEmpty && (
+              <div className="rounded-lg border border-rose-500/70 bg-rose-950/50 px-3 py-2 text-xs text-rose-200 font-medium">
+                No image model on this key; using low quality SVG
+              </div>
+            )}
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
               <input
                 type="text"

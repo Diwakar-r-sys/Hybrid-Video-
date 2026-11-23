@@ -13,7 +13,7 @@ import {
 import { CharacterStudio } from './components/CharacterStudio';
 import { ExportStudio } from './components/ExportStudio';
 import { StoryboardEditor } from './components/StoryboardEditor';
-import { TopBar, WorkspaceTab } from './components/TopBar';
+import { ServerModelHealth, TopBar, WorkspaceTab } from './components/TopBar';
 import {
   BUILTIN_PRESETS,
   CHANNEL_REFERENCE_ID,
@@ -311,6 +311,7 @@ export default function App() {
   const [exportProgress, setExportProgress] = useState<ExportProgress | null>(null);
   const [exportResult, setExportResult] = useState<ExportResult | null>(null);
   const [lastModelUsed, setLastModelUsed] = useState<string | null>(null);
+  const [modelHealth, setModelHealth] = useState<ServerModelHealth | null>(null);
   const [liveProgressText, setLiveProgressText] = useState<string | null>(null);
   const [statusNotice, setStatusNotice] = useState<{
     tab: WorkspaceTab;
@@ -359,6 +360,21 @@ export default function App() {
   const handleSelectTab = useCallback((nextTab: WorkspaceTab) => {
     setStatusNotice(null);
     setActiveTab(nextTab);
+  }, []);
+
+  // Fetch discovered model lists & health warnings on mount
+  useEffect(() => {
+    let cancelled = false;
+    safeFetchJson<ServerModelHealth>('/api/health')
+      .then((health) => {
+        if (!cancelled && health?.models) {
+          setModelHealth(health);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // 1. Initialize built-in Grandma, King & Soldier #FF00FF cutout rigs once on mount
@@ -1120,6 +1136,7 @@ export default function App() {
         onQuickExport={handleExportMp4}
         isExporting={isExporting}
         modelUsed={lastModelUsed}
+        modelHealth={modelHealth}
       />
 
       {audioDataUrl && (
@@ -1357,6 +1374,12 @@ export default function App() {
                       : '1 storyboard call (+1 per new character)'}
                   </div>
 
+                  {modelHealth && modelHealth.models.IMAGE_MODELS.length === 0 && (
+                    <div className="rounded-lg border border-rose-500/70 bg-rose-950/50 px-3 py-2 text-xs text-rose-200 font-medium">
+                      No image model on this key; using low quality SVG
+                    </div>
+                  )}
+
                   <button
                     type="button"
                     disabled={isAnalyzing}
@@ -1591,6 +1614,9 @@ export default function App() {
             onAutoLabelPieces={handleAutoLabelPieces}
             isBusy={isCharBusy}
             liveProgressText={liveProgressText}
+            imageModelsEmpty={Boolean(
+              modelHealth && modelHealth.models.IMAGE_MODELS.length === 0
+            )}
           />
         )}
 

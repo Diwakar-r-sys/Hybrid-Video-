@@ -16,7 +16,7 @@ function parseEnvModelList(
   defaults: string[]
 ): string[] {
   const combined = listEnv || singleEnv;
-  if (!combined || !combined.trim()) return defaults;
+  if (!combined || !combined.trim()) return [...defaults];
   return combined
     .split(',')
     .map((s) => s.trim())
@@ -50,6 +50,28 @@ const HAS_CUSTOM_TTS_MODELS = Boolean(
   process.env.GEMINI_TTS_MODELS?.trim() || process.env.GEMINI_TTS_MODEL?.trim()
 );
 
+const INITIAL_TEXT_MODELS = HAS_CUSTOM_TEXT_MODELS
+  ? parseEnvModelList(
+      process.env.GEMINI_TEXT_MODELS,
+      process.env.GEMINI_TEXT_MODEL,
+      BASE_TEXT_MODELS
+    )
+  : [...ALL_KNOWN_TEXT_MODELS];
+const INITIAL_IMAGE_MODELS = HAS_CUSTOM_IMAGE_MODELS
+  ? parseEnvModelList(
+      process.env.GEMINI_IMAGE_MODELS,
+      process.env.GEMINI_IMAGE_MODEL,
+      BASE_IMAGE_MODELS
+    )
+  : [...BASE_IMAGE_MODELS];
+const INITIAL_TTS_MODELS = HAS_CUSTOM_TTS_MODELS
+  ? parseEnvModelList(
+      process.env.GEMINI_TTS_MODELS,
+      process.env.GEMINI_TTS_MODEL,
+      BASE_TTS_MODELS
+    )
+  : [...BASE_TTS_MODELS];
+
 export const MODEL_CONFIG = {
   TEXT_MODELS: parseEnvModelList(
     process.env.GEMINI_TEXT_MODELS,
@@ -59,7 +81,7 @@ export const MODEL_CONFIG = {
   IMAGE_MODELS: parseEnvModelList(
     process.env.GEMINI_IMAGE_MODELS,
     process.env.GEMINI_IMAGE_MODEL,
-    ['gemini-3.1-flash-lite-image', 'gemini-nano-banana-2.1']
+    BASE_IMAGE_MODELS
   ),
   TTS_MODELS: parseEnvModelList(
     process.env.GEMINI_TTS_MODELS,
@@ -69,35 +91,138 @@ export const MODEL_CONFIG = {
 };
 
 let modelsDiscoveredForKey = false;
+let lastDiscoveryFallbacks: Partial<Record<'TEXT_MODELS' | 'IMAGE_MODELS' | 'TTS_MODELS', string[]>> = {};
+
+export function compareModelsNewestFirst(a: string, b: string): number {
+  const numsA = (a.match(/\d+/g) || []).map(Number);
+  const numsB = (b.match(/\d+/g) || []).map(Number);
+  const maxLen = Math.max(numsA.length, numsB.length);
+  for (let i = 0; i < maxLen; i++) {
+    const va = numsA[i] ?? 0;
+    const vb = numsB[i] ?? 0;
+    if (vb !== va) return vb - va;
+  }
+  const aLite = /\blite\b/i.test(a) ? 1 : 0;
+  const bLite = /\blite\b/i.test(b) ? 1 : 0;
+  if (aLite !== bLite) return aLite - bLite;
+  return b.localeCompare(a, undefined, { numeric: true });
+}
+
+function isDiscoveredTextModel(name: string): boolean {
+  const lower = name.toLowerCase();
+  return (
+    lower.includes('flash') &&
+    !lower.includes('image') &&
+    !lower.includes('tts') &&
+    !lower.includes('live')
+  );
+}
+
+function isDiscoveredImageModel(name: string): boolean {
+  return name.toLowerCase().includes('image');
+}
+
+function isDiscoveredTtsModel(name: string): boolean {
+  return name.toLowerCase().includes('tts');
+}
+
+function resolveDiscoveredCategory(
+  kind: 'TEXT_MODELS' | 'IMAGE_MODELS' | 'TTS_MODELS',
+  knownList: string[],
+  availableUnique: string[],
+  availableSet: Set<string>,
+  matcher: (name: string) => boolean
+): { models: string[]; usedFallback: boolean } {
+  const knownPresent = knownList.filter((m) => availableSet.has(m));
+  const knownPresentSet = new Set(knownPresent);
+  const matchingExtras = availableUnique
+    .filter((m) => !knownPresentSet.has(m) && matcher(m))
+    .sort(compareModelsNewestFirst);
+
+  if (knownPresent.length === 0 && matchingExtras.length > 0) {
+    console.warn(
+      `[Models] Fallback used for ${kind} (no known models available); selected discovered models newest-first: ${matchingExtras.join(', ')}`
+    );
+    return { models: matchingExtras, usedFallback: true };
+  }
+
+  if (matchingExtras.length > 0) {
+    console.info(
+      `[Models] Added newly discovered ${kind} after known models: ${matchingExtras.join(', ')}`
+    );
+  } else if (knownPresent.length === 0) {
+    console.warn(
+      `[Models] Warning: ${kind} is empty after discovery and name-based fallback.`
+    );
+  }
+
+  return { models: [...knownPresent, ...matchingExtras], usedFallback: false };
+}
+
+function getModelHealthWarnings(): {
+  emptyCategories: Array<'TEXT_MODELS' | 'IMAGE_MODELS' | 'TTS_MODELS'>;
+  warnings: string[];
+} {
+  const emptyCategories: Array<'TEXT_MODELS' | 'IMAGE_MODELS' | 'TTS_MODELS'> = [];
+  const warnings: string[] = [];
+
+  if (MODEL_CONFIG.TEXT_MODELS.length === 0) {
+    emptyCategories.push('TEXT_MODELS');
+    warnings.push('No text model available on this key.');
+  }
+  if (MODEL_CONFIG.IMAGE_MODELS.length === 0) {
+    emptyCategories.push('IMAGE_MODELS');
+    warnings.push('No image model on this key; using low quality SVG');
+  }
+  if (MODEL_CONFIG.TTS_MODELS.length === 0) {
+    emptyCategories.push('TTS_MODELS');
+    warnings.push('No TTS voice model available on this key.');
+  }
+  return { emptyCategories, warnings };
+}
 
 function syncDiscoveredModels(availableNames: string[]): void {
-  const availableSet = new Set(
-    availableNames.map((n) => n.replace(/^models\//, '').trim()).filter(Boolean)
+  const availableUnique: string[] = [];
+  const availableSet = new Set<string>();
+  for (const raw of availableNames) {
+    const clean = raw.replace(/^models\//, '').trim();
+    if (clean && !availableSet.has(clean)) {
+      availableSet.add(clean);
+      availableUnique.push(clean);
+    }
+  }
+
+  const textRes = resolveDiscoveredCategory(
+    'TEXT_MODELS',
+    INITIAL_TEXT_MODELS,
+    availableUnique,
+    availableSet,
+    isDiscoveredTextModel
+  );
+  const imgRes = resolveDiscoveredCategory(
+    'IMAGE_MODELS',
+    INITIAL_IMAGE_MODELS,
+    availableUnique,
+    availableSet,
+    isDiscoveredImageModel
+  );
+  const ttsRes = resolveDiscoveredCategory(
+    'TTS_MODELS',
+    INITIAL_TTS_MODELS,
+    availableUnique,
+    availableSet,
+    isDiscoveredTtsModel
   );
 
-  if (!HAS_CUSTOM_TEXT_MODELS) {
-    const filteredText = ALL_KNOWN_TEXT_MODELS.filter((m) => availableSet.has(m));
-    MODEL_CONFIG.TEXT_MODELS.splice(0, MODEL_CONFIG.TEXT_MODELS.length, ...filteredText);
-  } else {
-    const filteredText = MODEL_CONFIG.TEXT_MODELS.filter((m) => availableSet.has(m));
-    MODEL_CONFIG.TEXT_MODELS.splice(0, MODEL_CONFIG.TEXT_MODELS.length, ...filteredText);
-  }
+  MODEL_CONFIG.TEXT_MODELS.splice(0, MODEL_CONFIG.TEXT_MODELS.length, ...textRes.models);
+  MODEL_CONFIG.IMAGE_MODELS.splice(0, MODEL_CONFIG.IMAGE_MODELS.length, ...imgRes.models);
+  MODEL_CONFIG.TTS_MODELS.splice(0, MODEL_CONFIG.TTS_MODELS.length, ...ttsRes.models);
 
-  if (!HAS_CUSTOM_IMAGE_MODELS) {
-    const filteredImg = BASE_IMAGE_MODELS.filter((m) => availableSet.has(m));
-    MODEL_CONFIG.IMAGE_MODELS.splice(0, MODEL_CONFIG.IMAGE_MODELS.length, ...filteredImg);
-  } else {
-    const filteredImg = MODEL_CONFIG.IMAGE_MODELS.filter((m) => availableSet.has(m));
-    MODEL_CONFIG.IMAGE_MODELS.splice(0, MODEL_CONFIG.IMAGE_MODELS.length, ...filteredImg);
-  }
-
-  if (!HAS_CUSTOM_TTS_MODELS) {
-    const filteredTts = BASE_TTS_MODELS.filter((m) => availableSet.has(m));
-    MODEL_CONFIG.TTS_MODELS.splice(0, MODEL_CONFIG.TTS_MODELS.length, ...filteredTts);
-  } else {
-    const filteredTts = MODEL_CONFIG.TTS_MODELS.filter((m) => availableSet.has(m));
-    MODEL_CONFIG.TTS_MODELS.splice(0, MODEL_CONFIG.TTS_MODELS.length, ...filteredTts);
-  }
+  const fallbacks: Partial<Record<'TEXT_MODELS' | 'IMAGE_MODELS' | 'TTS_MODELS', string[]>> = {};
+  if (textRes.usedFallback) fallbacks.TEXT_MODELS = textRes.models;
+  if (imgRes.usedFallback) fallbacks.IMAGE_MODELS = imgRes.models;
+  if (ttsRes.usedFallback) fallbacks.TTS_MODELS = ttsRes.models;
+  lastDiscoveryFallbacks = fallbacks;
 
   modelsDiscoveredForKey = true;
 }
@@ -407,10 +532,15 @@ export async function generateWithRetry(
 
 app.get('/api/health', async (_req, res) => {
   if (!process.env.GEMINI_API_KEY) {
+    const { emptyCategories, warnings } = getModelHealthWarnings();
     res.json({
       ok: true,
       hasApiKey: false,
-      models: MODEL_CONFIG
+      modelsDiscovered: modelsDiscoveredForKey,
+      models: MODEL_CONFIG,
+      emptyCategories,
+      warnings,
+      fallbacksUsed: lastDiscoveryFallbacks
     });
     return;
   }
@@ -418,20 +548,28 @@ app.get('/api/health', async (_req, res) => {
   try {
     const ai = getGeminiClient();
     await listAvailableModelNames(ai);
+    const { emptyCategories, warnings } = getModelHealthWarnings();
     res.json({
       ok: true,
       hasApiKey: true,
       modelsDiscovered: modelsDiscoveredForKey,
-      models: MODEL_CONFIG
+      models: MODEL_CONFIG,
+      emptyCategories,
+      warnings,
+      fallbacksUsed: lastDiscoveryFallbacks
     });
   } catch (err: unknown) {
     const info = extractApiErrorInfo(err);
+    const { emptyCategories, warnings } = getModelHealthWarnings();
     res.json({
       ok: true,
       hasApiKey: false,
       apiKeyError: info.message,
       modelsDiscovered: modelsDiscoveredForKey,
-      models: MODEL_CONFIG
+      models: MODEL_CONFIG,
+      emptyCategories,
+      warnings,
+      fallbacksUsed: lastDiscoveryFallbacks
     });
   }
 });
@@ -440,18 +578,26 @@ app.get('/api/models', async (_req, res) => {
   try {
     const ai = getGeminiClient();
     const available = await listAvailableModelNames(ai);
+    const { emptyCategories, warnings } = getModelHealthWarnings();
     res.json({
       ok: true,
       configured: MODEL_CONFIG,
+      emptyCategories,
+      warnings,
+      fallbacksUsed: lastDiscoveryFallbacks,
       available
     });
   } catch (err: unknown) {
     const info = extractApiErrorInfo(err);
+    const { emptyCategories, warnings } = getModelHealthWarnings();
     res.status(info.status >= 400 && info.status < 600 ? info.status : 500).json({
       ok: false,
       error: info.message,
       code: info.status,
-      configured: MODEL_CONFIG
+      configured: MODEL_CONFIG,
+      emptyCategories,
+      warnings,
+      fallbacksUsed: lastDiscoveryFallbacks
     });
   }
 });
