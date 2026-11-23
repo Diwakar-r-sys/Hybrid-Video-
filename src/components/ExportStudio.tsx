@@ -200,26 +200,33 @@ export const ExportStudio: React.FC<ExportStudioProps> = ({
           )}
 
           {exportResult && (
-            <div className="rounded-xl border border-emerald-800/60 bg-emerald-950/25 p-4 flex flex-wrap items-center justify-between gap-3">
-              <div className="text-xs space-y-0.5">
-                <div className="font-semibold text-emerald-300">
-                  {exportResult.filename}
+            <div className="space-y-3">
+              <div className="rounded-xl border border-emerald-800/60 bg-emerald-950/25 p-4 flex flex-wrap items-center justify-between gap-3">
+                <div className="text-xs space-y-0.5">
+                  <div className="font-semibold text-emerald-300">
+                    {exportResult.filename}
+                  </div>
+                  <div className="text-slate-400 font-mono">
+                    {exportResult.totalFrames} frames ·{' '}
+                    {exportResult.hasEmbeddedAudio
+                      ? 'Video + Audio embedded'
+                      : 'Silent H.264 video track'}
+                  </div>
                 </div>
-                <div className="text-slate-400 font-mono">
-                  {exportResult.totalFrames} frames ·{' '}
-                  {exportResult.hasEmbeddedAudio
-                    ? 'Video + Audio embedded'
-                    : 'Silent H.264 video track'}
-                </div>
+                <a
+                  href={exportResult.blobUrl}
+                  download={exportResult.filename}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-semibold whitespace-nowrap"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  Download MP4
+                </a>
               </div>
-              <a
-                href={exportResult.blobUrl}
-                download={exportResult.filename}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-semibold whitespace-nowrap"
-              >
-                <Download className="w-3.5 h-3.5" />
-                Download MP4
-              </a>
+              {exportResult.audioWarning && (
+                <div className="rounded-lg border border-amber-700/70 bg-amber-950/35 px-3.5 py-2.5 text-xs text-amber-200 font-medium">
+                  {exportResult.audioWarning}
+                </div>
+              )}
             </div>
           )}
         </div>

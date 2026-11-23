@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import {
   AspectMode,
+  CharacterAction,
   CutPiece,
   EnvironmentPreset,
   PieceRole,
@@ -15,15 +16,182 @@ interface CharacterRigInstance {
   head?: THREE.Group;
   leftArm?: THREE.Group;
   rightArm?: THREE.Group;
+  leftUpperArm?: THREE.Group;
+  leftForearm?: THREE.Group;
+  rightUpperArm?: THREE.Group;
+  rightForearm?: THREE.Group;
   leftLeg?: THREE.Group;
   rightLeg?: THREE.Group;
   needles?: THREE.Group;
   scarfProp?: THREE.Group;
+  handAnchor: THREE.Object3D;
   baseTorsoY: number;
+  baseLeftLegY: number;
+  baseRightLegY: number;
+}
+
+export interface DeterministicPose {
+  action: CharacterAction;
+  torsoBobY: number;
+  headRotZ: number;
+  leftArmRotZ: number;
+  rightArmRotZ: number;
+  leftForearmRotZ: number;
+  rightForearmRotZ: number;
+  leftLegRotZ: number;
+  rightLegRotZ: number;
+  leftLegYOffset: number;
+  rightLegYOffset: number;
+  needlesRotZ: number;
+  scarfRotZ: number;
+}
+
+export function normalizeActionEnum(raw: string | undefined): CharacterAction {
+  const s = String(raw || '').trim().toLowerCase();
+  if (s === 'idle' || s === 'knit' || s === 'walk' || s === 'point' || s === 'stand_guard') {
+    return s;
+  }
+  if (/knit|stitch|needle|yarn|wool/.test(s)) return 'knit';
+  if (/walk|march|step|stride|run/.test(s)) return 'walk';
+  if (/point|gestur|boast|wave|shout|celebrat/.test(s)) return 'point';
+  if (/guard|watch|stand|alert|spear/.test(s)) return 'stand_guard';
+  return 'idle';
+}
+
+export function computeRigPoseAtTime(
+  rawAction: string | undefined,
+  t: number,
+  opts: {
+    speed: number;
+    armAmp: number;
+    headAmp: number;
+    bobAmp: number;
+    walkAmp: number;
+    phaseOffset?: number;
+  }
+): DeterministicPose {
+  const action = normalizeActionEnum(rawAction);
+  const phaseOff = opts.phaseOffset ?? 0;
+  const speed = Math.max(0.4, opts.speed);
+  const armAmp = opts.armAmp;
+  const headAmp = opts.headAmp;
+  const bobAmp = opts.bobAmp;
+  const legAmp = Math.max(0.22, opts.walkAmp || 0.32);
+
+  switch (action) {
+    case 'walk': {
+      const walkFreq = Math.max(1.2, speed * 0.45);
+      const phase = t * Math.PI * 2 * walkFreq + phaseOff;
+      const sw = Math.sin(phase);
+      // Grounded stance: swinging leg rotates forward cleanly, planted leg anchors near 0
+      const leftLegRotZ = sw >= 0 ? sw * legAmp : sw * legAmp * 0.25;
+      const rightLegRotZ = -sw >= 0 ? -sw * legAmp : -sw * legAmp * 0.25;
+      const leftLegYOffset = Math.max(0, sw) * 0.045;
+      const rightLegYOffset = Math.max(0, -sw) * 0.045;
+      // Body bob timed to double step frequency
+      const torsoBobY = Math.abs(Math.sin(phase)) * bobAmp * 1.45;
+      // Arms swing opposite to legs + elbow bend
+      const leftArmRotZ = 0.16 - sw * armAmp;
+      const rightArmRotZ = -0.16 - sw * armAmp;
+      const leftForearmRotZ = 0.26 + Math.max(0, -sw) * 0.36;
+      const rightForearmRotZ = -0.26 - Math.max(0, sw) * 0.36;
+      const headRotZ = Math.sin(phase - 0.55) * headAmp;
+      const scarfRotZ = -sw * 0.14 + Math.sin(phase - 0.85) * 0.08;
+      return {
+        action,
+        torsoBobY,
+        headRotZ,
+        leftArmRotZ,
+        rightArmRotZ,
+        leftForearmRotZ,
+        rightForearmRotZ,
+        leftLegRotZ,
+        rightLegRotZ,
+        leftLegYOffset,
+        rightLegYOffset,
+        needlesRotZ: Math.sin(phase) * (armAmp * 0.2),
+        scarfRotZ
+      };
+    }
+    case 'knit': {
+      const phase = t * Math.PI * 2 * speed + phaseOff;
+      return {
+        action,
+        torsoBobY: Math.sin(t * Math.PI * 2 * 1.8 + phaseOff) * bobAmp * 0.65,
+        headRotZ: Math.sin(t * Math.PI * 2 * 1.5 + phaseOff - 0.5) * headAmp,
+        leftArmRotZ: 0.3 + Math.sin(phase) * armAmp * 0.85,
+        rightArmRotZ: -0.3 + Math.sin(phase + Math.PI) * armAmp * 0.85,
+        leftForearmRotZ: 0.36 + Math.sin(phase + 0.35) * armAmp * 0.95,
+        rightForearmRotZ: -0.36 + Math.sin(phase + Math.PI + 0.35) * armAmp * 0.95,
+        leftLegRotZ: 0,
+        rightLegRotZ: 0,
+        leftLegYOffset: 0,
+        rightLegYOffset: 0,
+        needlesRotZ: 0.1 + Math.sin(phase) * (armAmp * 0.38),
+        scarfRotZ: Math.sin(t * Math.PI * 2 * 1.5 + phaseOff - 0.9) * 0.06
+      };
+    }
+    case 'point': {
+      const phase = t * Math.PI * 2 * Math.max(1.2, speed * 0.55) + phaseOff;
+      return {
+        action,
+        torsoBobY: Math.abs(Math.sin(phase)) * bobAmp * 1.1,
+        headRotZ: Math.sin(phase - 0.45) * headAmp * 1.15,
+        leftArmRotZ: 0.22 + Math.sin(phase) * armAmp * 0.25,
+        rightArmRotZ: -0.88 + Math.sin(phase) * armAmp * 0.42,
+        leftForearmRotZ: 0.18,
+        rightForearmRotZ: -0.2 + Math.sin(phase + 0.3) * armAmp * 0.25,
+        leftLegRotZ: 0.03,
+        rightLegRotZ: -0.03,
+        leftLegYOffset: 0,
+        rightLegYOffset: 0,
+        needlesRotZ: -0.25 + Math.sin(phase) * armAmp * 0.35,
+        scarfRotZ: Math.sin(phase - 0.8) * 0.1
+      };
+    }
+    case 'stand_guard': {
+      const phase = t * Math.PI * 2 * 0.9 + phaseOff;
+      return {
+        action,
+        torsoBobY: Math.sin(phase) * bobAmp * 0.35,
+        headRotZ: Math.sin(phase * 0.85 - 0.4) * headAmp * 0.8,
+        leftArmRotZ: 0.16 + Math.sin(phase) * armAmp * 0.14,
+        rightArmRotZ: -0.18 + Math.sin(phase + 0.5) * armAmp * 0.14,
+        leftForearmRotZ: 0.14,
+        rightForearmRotZ: -0.16,
+        leftLegRotZ: 0.04,
+        rightLegRotZ: -0.04,
+        leftLegYOffset: 0,
+        rightLegYOffset: 0,
+        needlesRotZ: -0.08 + Math.sin(phase) * 0.04,
+        scarfRotZ: Math.sin(phase - 0.7) * 0.04
+      };
+    }
+    case 'idle':
+    default: {
+      const phase = t * Math.PI * 2 * 1.15 + phaseOff;
+      return {
+        action: 'idle',
+        torsoBobY: Math.sin(phase) * bobAmp * 0.5,
+        headRotZ: Math.sin(phase * 0.85 - 0.55) * headAmp,
+        leftArmRotZ: 0.22 + Math.sin(phase - 0.3) * armAmp * 0.32,
+        rightArmRotZ: -0.22 - Math.sin(phase - 0.3) * armAmp * 0.32,
+        leftForearmRotZ: 0.12 + Math.sin(phase - 0.6) * armAmp * 0.25,
+        rightForearmRotZ: -0.12 - Math.sin(phase - 0.6) * armAmp * 0.25,
+        leftLegRotZ: 0,
+        rightLegRotZ: 0,
+        leftLegYOffset: 0,
+        rightLegYOffset: 0,
+        needlesRotZ: Math.sin(phase - 0.4) * 0.06,
+        scarfRotZ: Math.sin(phase - 0.85) * 0.05
+      };
+    }
+  }
 }
 
 const _camPos = new THREE.Vector3();
 const _camLook = new THREE.Vector3();
+const _handAnchorWorld = new THREE.Vector3();
 
 function detectSoftwareWebGL(): boolean {
   try {
@@ -60,6 +228,7 @@ export class HybridStageEngine {
   private keyDirLight: THREE.DirectionalLight;
   private hemiLight: THREE.HemisphereLight;
   private shadowTex: THREE.CanvasTexture;
+  private cutHoldCanvas: HTMLCanvasElement | null = null;
   private disposed = false;
 
   constructor(aspectMode: AspectMode = '9:16') {
@@ -858,7 +1027,7 @@ export class HybridStageEngine {
       piece: CutPiece | undefined,
       fallbackHeight: number,
       zOffset: number
-    ): Promise<THREE.Group | undefined> => {
+    ): Promise<{ group: THREE.Group; worldW: number; worldH: number } | undefined> => {
       if (!piece) return undefined;
       const tex = await new THREE.TextureLoader().loadAsync(piece.haloDataUrl);
       tex.colorSpace = THREE.SRGBColorSpace;
@@ -888,100 +1057,157 @@ export class HybridStageEngine {
       const g = new THREE.Group();
       g.position.z = zOffset;
       g.add(mesh);
-      return g;
+      return { group: g, worldW, worldH };
     };
 
+    const handAnchor = new THREE.Object3D();
     const rig: CharacterRigInstance = {
       root,
-      baseTorsoY: 1.24
+      handAnchor,
+      baseTorsoY: 1.24,
+      baseLeftLegY: -0.44,
+      baseRightLegY: -0.44
     };
 
-    const torso = await buildPartGroup(byRole.Torso, 1.38, 0.0);
-    if (torso) {
-      torso.position.set(0, rig.baseTorsoY, 0);
-      root.add(torso);
-      rig.torso = torso;
+    const torsoBuilt = await buildPartGroup(byRole.Torso, 1.38, 0.0);
+    if (torsoBuilt) {
+      torsoBuilt.group.position.set(0, rig.baseTorsoY, 0);
+      root.add(torsoBuilt.group);
+      rig.torso = torsoBuilt.group;
     }
 
-    const hub = torso || root;
-    const hubOffset = torso ? 0 : rig.baseTorsoY;
+    const hub = torsoBuilt?.group || root;
+    const hubOffset = torsoBuilt ? 0 : rig.baseTorsoY;
+    rig.baseLeftLegY = -0.44 + hubOffset;
+    rig.baseRightLegY = -0.44 + hubOffset;
 
-    const head = await buildPartGroup(byRole.Head, 1.05, 0.035);
-    if (head) {
-      head.position.set(0, 0.56 + hubOffset, 0.035);
-      hub.add(head);
-      rig.head = head;
+    const headBuilt = await buildPartGroup(byRole.Head, 1.05, 0.035);
+    if (headBuilt) {
+      headBuilt.group.position.set(0, 0.56 + hubOffset, 0.035);
+      hub.add(headBuilt.group);
+      rig.head = headBuilt.group;
     }
 
-    const leftLeg = await buildPartGroup(byRole.LeftLeg, 0.92, -0.025);
-    if (leftLeg) {
-      leftLeg.position.set(-0.22, -0.44 + hubOffset, -0.025);
-      hub.add(leftLeg);
-      rig.leftLeg = leftLeg;
+    const leftLegBuilt = await buildPartGroup(byRole.LeftLeg, 0.92, -0.025);
+    if (leftLegBuilt) {
+      leftLegBuilt.group.position.set(-0.22, rig.baseLeftLegY, -0.025);
+      hub.add(leftLegBuilt.group);
+      rig.leftLeg = leftLegBuilt.group;
     }
 
-    const rightLeg = await buildPartGroup(byRole.RightLeg, 0.92, -0.025);
-    if (rightLeg) {
-      rightLeg.position.set(0.22, -0.44 + hubOffset, -0.025);
-      hub.add(rightLeg);
-      rig.rightLeg = rightLeg;
+    const rightLegBuilt = await buildPartGroup(byRole.RightLeg, 0.92, -0.025);
+    if (rightLegBuilt) {
+      rightLegBuilt.group.position.set(0.22, rig.baseRightLegY, -0.025);
+      hub.add(rightLegBuilt.group);
+      rig.rightLeg = rightLegBuilt.group;
     }
 
-    const leftArm = await buildPartGroup(byRole.LeftArm, 0.88, 0.025);
-    if (leftArm) {
-      leftArm.position.set(-0.34, 0.42 + hubOffset, 0.025);
-      leftArm.rotation.z = 0.25;
-      hub.add(leftArm);
-      rig.leftArm = leftArm;
+    // Articulated LeftUpperArm -> LeftForearm or single LeftArm
+    const leftUpperBuilt = await buildPartGroup(byRole.LeftUpperArm, 0.48, 0.025);
+    const leftForeBuilt = await buildPartGroup(byRole.LeftForearm, 0.48, 0.008);
+    if (leftUpperBuilt) {
+      leftUpperBuilt.group.position.set(-0.34, 0.42 + hubOffset, 0.025);
+      leftUpperBuilt.group.rotation.z = 0.25;
+      hub.add(leftUpperBuilt.group);
+      rig.leftUpperArm = leftUpperBuilt.group;
+      if (leftForeBuilt) {
+        leftForeBuilt.group.position.set(0, -leftUpperBuilt.worldH * 0.72, 0.008);
+        leftUpperBuilt.group.add(leftForeBuilt.group);
+        rig.leftForearm = leftForeBuilt.group;
+      }
+    } else {
+      const leftArmBuilt = await buildPartGroup(byRole.LeftArm, 0.88, 0.025);
+      if (leftArmBuilt) {
+        leftArmBuilt.group.position.set(-0.34, 0.42 + hubOffset, 0.025);
+        leftArmBuilt.group.rotation.z = 0.25;
+        hub.add(leftArmBuilt.group);
+        rig.leftArm = leftArmBuilt.group;
+      }
     }
 
-    const rightArm = await buildPartGroup(byRole.RightArm, 0.88, 0.025);
-    if (rightArm) {
-      rightArm.position.set(0.34, 0.42 + hubOffset, 0.025);
-      rightArm.rotation.z = -0.25;
-      hub.add(rightArm);
-      rig.rightArm = rightArm;
+    // Articulated RightUpperArm -> RightForearm or single RightArm
+    const rightUpperBuilt = await buildPartGroup(byRole.RightUpperArm, 0.48, 0.025);
+    const rightForeBuilt = await buildPartGroup(byRole.RightForearm, 0.48, 0.008);
+    let rightHandLocalY = -0.35;
+    if (rightUpperBuilt) {
+      rightUpperBuilt.group.position.set(0.34, 0.42 + hubOffset, 0.025);
+      rightUpperBuilt.group.rotation.z = -0.25;
+      hub.add(rightUpperBuilt.group);
+      rig.rightUpperArm = rightUpperBuilt.group;
+      if (rightForeBuilt) {
+        rightForeBuilt.group.position.set(0, -rightUpperBuilt.worldH * 0.72, 0.008);
+        rightUpperBuilt.group.add(rightForeBuilt.group);
+        rig.rightForearm = rightForeBuilt.group;
+        rightHandLocalY = -rightForeBuilt.worldH * 0.75;
+      } else {
+        rightHandLocalY = -rightUpperBuilt.worldH * 0.75;
+      }
+    } else {
+      const rightArmBuilt = await buildPartGroup(byRole.RightArm, 0.88, 0.025);
+      if (rightArmBuilt) {
+        rightArmBuilt.group.position.set(0.34, 0.42 + hubOffset, 0.025);
+        rightArmBuilt.group.rotation.z = -0.25;
+        hub.add(rightArmBuilt.group);
+        rig.rightArm = rightArmBuilt.group;
+        rightHandLocalY = -rightArmBuilt.worldH * 0.72;
+      }
     }
 
     const lowerName = name.toLowerCase();
     const isGrandma = /grandma|granny|dadi|दादी/.test(lowerName);
     const isSoldier = /soldier|guard|knight|सैनिक|senik/.test(lowerName);
 
-    const needles = await buildPartGroup(byRole.PropNeedles, 0.85, 0.05);
-    if (needles) {
+    const needlesBuilt = await buildPartGroup(byRole.PropNeedles, 0.85, 0.05);
+    if (needlesBuilt) {
       if (isGrandma) {
-        needles.position.set(-0.02, -0.06 + hubOffset, 0.05);
-        needles.rotation.z = 0.1;
+        needlesBuilt.group.position.set(-0.02, -0.06 + hubOffset, 0.05);
+        needlesBuilt.group.rotation.z = 0.1;
       } else {
-        // Scepter / Spear held cleanly at right side
-        needles.position.set(0.5, 0.12 + hubOffset, 0.055);
-        needles.rotation.z = -0.1;
+        needlesBuilt.group.position.set(0.5, 0.12 + hubOffset, 0.055);
+        needlesBuilt.group.rotation.z = -0.1;
       }
-      hub.add(needles);
-      rig.needles = needles;
+      hub.add(needlesBuilt.group);
+      rig.needles = needlesBuilt.group;
     }
 
-    const scarfProp = await buildPartGroup(byRole.PropScarf, 0.85, 0.045);
-    if (scarfProp) {
+    const scarfPropBuilt = await buildPartGroup(byRole.PropScarf, 0.85, 0.045);
+    if (scarfPropBuilt) {
       if (isSoldier) {
-        // Heraldic shield held on left arm
-        scarfProp.position.set(-0.48, 0.02 + hubOffset, 0.06);
+        scarfPropBuilt.group.position.set(-0.48, 0.02 + hubOffset, 0.06);
       } else if (!isGrandma) {
-        // Royal sash / collar chain
-        scarfProp.position.set(0, 0.36 + hubOffset, 0.045);
+        scarfPropBuilt.group.position.set(0, 0.36 + hubOffset, 0.045);
       } else {
-        scarfProp.position.set(-0.04, -0.05 + hubOffset, 0.045);
+        scarfPropBuilt.group.position.set(-0.04, -0.05 + hubOffset, 0.045);
       }
-      hub.add(scarfProp);
-      rig.scarfProp = scarfProp;
+      hub.add(scarfPropBuilt.group);
+      rig.scarfProp = scarfPropBuilt.group;
+    }
+
+    // Anchor 3D scarf/prop growth directly to hands or knitting needles (never feet)
+    if (rig.needles) {
+      handAnchor.position.set(0, -0.02, 0.04);
+      rig.needles.add(handAnchor);
+    } else if (rig.rightForearm) {
+      handAnchor.position.set(0, rightHandLocalY, 0.04);
+      rig.rightForearm.add(handAnchor);
+    } else if (rig.rightArm) {
+      handAnchor.position.set(0, rightHandLocalY, 0.04);
+      rig.rightArm.add(handAnchor);
+    } else {
+      handAnchor.position.set(0, -0.04 + hubOffset, 0.06);
+      hub.add(handAnchor);
     }
 
     this.characterRigs.set(name, rig);
   }
 
-  private _update3DScarf(preset: EnvironmentPreset, progress: number, anchorX: number): void {
+  private _update3DScarf(
+    preset: EnvironmentPreset,
+    progress: number,
+    anchorPos: THREE.Vector3
+  ): void {
     const clampedP = Math.max(0, Math.min(1, progress));
-    const key = `${preset}:${anchorX.toFixed(2)}:${Math.round(clampedP * 120)}`;
+    const key = `${preset}:${anchorPos.x.toFixed(2)}:${anchorPos.y.toFixed(2)}:${anchorPos.z.toFixed(2)}:${Math.round(clampedP * 120)}`;
     if (key === this.lastScarfKey) return;
     this.lastScarfKey = key;
 
@@ -995,10 +1221,14 @@ export class HybridStageEngine {
     let fullPoints: THREE.Vector3[];
     let radius = 0.105;
 
+    const startX = anchorPos.x;
+    const startY = Math.max(0.75, anchorPos.y);
+    const startZ = anchorPos.z + 0.04;
+
     if (preset === 'dungeon') {
       fullPoints = [
-        new THREE.Vector3(anchorX, 0.42, 0.12),
-        new THREE.Vector3(anchorX + 0.02, 0.18, 0.55),
+        new THREE.Vector3(startX, startY, startZ),
+        new THREE.Vector3(startX + 0.02, Math.max(0.24, startY * 0.32), startZ + 0.34),
         new THREE.Vector3(0.05, 0.06, 0.95),
         new THREE.Vector3(-0.18, 0.055, 1.75),
         new THREE.Vector3(0.16, 0.055, 2.55),
@@ -1006,8 +1236,8 @@ export class HybridStageEngine {
       ];
     } else if (preset === 'village') {
       fullPoints = [
-        new THREE.Vector3(anchorX, 0.4, 0.15),
-        new THREE.Vector3(anchorX + 0.1, 0.06, 0.65),
+        new THREE.Vector3(startX, startY, startZ),
+        new THREE.Vector3(startX + 0.08, Math.max(0.2, startY * 0.25), startZ + 0.42),
         new THREE.Vector3(-0.22, 0.055, 1.45),
         new THREE.Vector3(0.28, 0.055, 2.35),
         new THREE.Vector3(-0.14, 0.055, 3.25),
@@ -1024,8 +1254,8 @@ export class HybridStageEngine {
       ];
     } else {
       fullPoints = [
-        new THREE.Vector3(anchorX - 0.04, 0.36, 0.14),
-        new THREE.Vector3(anchorX - 0.05, 0.07, 0.44),
+        new THREE.Vector3(startX, startY, startZ),
+        new THREE.Vector3(startX - 0.02, Math.max(0.22, startY * 0.28), startZ + 0.32),
         new THREE.Vector3(-0.22, 0.055, 1.05),
         new THREE.Vector3(0.16, 0.055, 1.85),
         new THREE.Vector3(-0.14, 0.055, 2.75),
@@ -1122,46 +1352,67 @@ export class HybridStageEngine {
     });
 
     let primaryAnchorX = -0.06;
+    let primaryRig: CharacterRigInstance | undefined;
     shot.characters.forEach((charState, idx) => {
       const rig =
         this._resolveRig(charState.name) ||
         this.characterRigs.values().next().value;
       if (!rig) return;
 
-      if (idx === 0) primaryAnchorX = charState.x;
+      if (idx === 0) {
+        primaryAnchorX = charState.x;
+        primaryRig = rig;
+      }
       rig.root.visible = true;
       rig.root.position.set(charState.x, 0, idx * 0.08);
       rig.root.scale.setScalar(charState.scale);
 
-      const speed = charState.knittingSpeed * timelineCfg.globalArmSpeed;
-      const headAmp = charState.headTiltAmp * timelineCfg.globalHeadTilt;
-      const bobAmp = charState.bodyBobAmp * timelineCfg.globalBodyBob;
+      const pose = computeRigPoseAtTime(charState.action, clampedT, {
+        speed: charState.knittingSpeed * timelineCfg.globalArmSpeed,
+        armAmp: charState.armSwingAmp,
+        headAmp: charState.headTiltAmp * timelineCfg.globalHeadTilt,
+        bobAmp: charState.bodyBobAmp * timelineCfg.globalBodyBob,
+        walkAmp: charState.walkCycleAmp,
+        phaseOffset: idx * 0.9
+      });
 
       if (rig.torso) {
-        rig.torso.position.y =
-          rig.baseTorsoY + Math.sin(clampedT * Math.PI * 2 * 2.0) * bobAmp;
+        rig.torso.position.y = rig.baseTorsoY + pose.torsoBobY;
       }
       if (rig.head) {
-        rig.head.rotation.z = Math.sin(clampedT * Math.PI * 2 * 1.8 + idx) * headAmp;
+        rig.head.rotation.z = pose.headRotZ;
+      }
+      if (rig.leftUpperArm) {
+        rig.leftUpperArm.rotation.z = pose.leftArmRotZ;
+      }
+      if (rig.leftForearm) {
+        rig.leftForearm.rotation.z = pose.leftForearmRotZ;
       }
       if (rig.leftArm) {
-        rig.leftArm.rotation.z =
-          0.25 + Math.sin(clampedT * Math.PI * 2 * speed) * charState.armSwingAmp;
+        rig.leftArm.rotation.z = pose.leftArmRotZ;
+      }
+      if (rig.rightUpperArm) {
+        rig.rightUpperArm.rotation.z = pose.rightArmRotZ;
+      }
+      if (rig.rightForearm) {
+        rig.rightForearm.rotation.z = pose.rightForearmRotZ;
       }
       if (rig.rightArm) {
-        rig.rightArm.rotation.z =
-          -0.25 +
-          Math.sin(clampedT * Math.PI * 2 * speed + Math.PI) * charState.armSwingAmp;
+        rig.rightArm.rotation.z = pose.rightArmRotZ;
       }
       if (rig.needles) {
-        rig.needles.rotation.z =
-          0.1 + Math.sin(clampedT * Math.PI * 2 * speed) * (charState.armSwingAmp * 0.35);
+        rig.needles.rotation.z = pose.needlesRotZ;
       }
-      if (rig.leftLeg && rig.rightLeg) {
-        const walk =
-          Math.sin(clampedT * Math.PI * 2 * 2.5) * charState.walkCycleAmp;
-        rig.leftLeg.rotation.z = walk;
-        rig.rightLeg.rotation.z = -walk;
+      if (rig.scarfProp) {
+        rig.scarfProp.rotation.z = pose.scarfRotZ;
+      }
+      if (rig.leftLeg) {
+        rig.leftLeg.rotation.z = pose.leftLegRotZ;
+        rig.leftLeg.position.y = rig.baseLeftLegY + pose.leftLegYOffset;
+      }
+      if (rig.rightLeg) {
+        rig.rightLeg.rotation.z = pose.rightLegRotZ;
+        rig.rightLeg.position.y = rig.baseRightLegY + pose.rightLegYOffset;
       }
     });
 
@@ -1171,14 +1422,20 @@ export class HybridStageEngine {
       this.chairGroup.position.set(primaryAnchorX, 0, -0.22);
     }
 
-    // 6. Dynamic 3D knitted scarf growth
+    // 6. Dynamic 3D knitted scarf growth anchored at hands/needles world position
     const easedP = 1 - Math.pow(1 - localP, 2.4);
     const scarfP = THREE.MathUtils.lerp(
       shot.props.scarfGrowthStart,
       shot.props.scarfGrowthEnd,
       easedP
     );
-    this._update3DScarf(shot.environmentPreset, scarfP, primaryAnchorX);
+    if (primaryRig) {
+      primaryRig.root.updateMatrixWorld(true);
+      primaryRig.handAnchor.getWorldPosition(_handAnchorWorld);
+    } else {
+      _handAnchorWorld.set(primaryAnchorX, 1.15, 0.14);
+    }
+    this._update3DScarf(shot.environmentPreset, scarfP, _handAnchorWorld);
 
     this.renderer.render(this.scene, this.camera);
     return this.renderer.domElement;
@@ -1190,7 +1447,6 @@ export class HybridStageEngine {
     shots: ShotSpec[],
     timelineCfg: TimelineConfig
   ): void {
-    const webglCanvas = this.evaluateAtTime(t, shots, timelineCfg);
     if (targetCanvas.width !== this.width || targetCanvas.height !== this.height) {
       targetCanvas.width = this.width;
       targetCanvas.height = this.height;
@@ -1198,7 +1454,47 @@ export class HybridStageEngine {
 
     const ctx = targetCanvas.getContext('2d')!;
     ctx.clearRect(0, 0, targetCanvas.width, targetCanvas.height);
-    ctx.drawImage(webglCanvas, 0, 0, targetCanvas.width, targetCanvas.height);
+
+    const clampedT = Math.max(0, Math.min(timelineCfg.duration, t));
+    let shotIdx = shots.findIndex((s) => clampedT >= s.start && clampedT <= s.end);
+    if (shotIdx < 0 && shots.length > 0) shotIdx = shots.length - 1;
+
+    const curShot = shots[shotIdx];
+    const cutWindow = 0.2;
+    const isInCutCrossfade =
+      shotIdx > 0 &&
+      curShot &&
+      curShot.end - curShot.start >= 0.4 &&
+      clampedT - curShot.start >= 0 &&
+      clampedT - curShot.start < cutWindow;
+
+    if (isInCutCrossfade) {
+      const prevShot = shots[shotIdx - 1];
+      const holdT = Math.max(prevShot.start, prevShot.end - 0.001);
+      const prevWebgl = this.evaluateAtTime(holdT, shots, timelineCfg);
+      if (!this.cutHoldCanvas) {
+        this.cutHoldCanvas = document.createElement('canvas');
+      }
+      if (this.cutHoldCanvas.width !== this.width || this.cutHoldCanvas.height !== this.height) {
+        this.cutHoldCanvas.width = this.width;
+        this.cutHoldCanvas.height = this.height;
+      }
+      const holdCtx = this.cutHoldCanvas.getContext('2d')!;
+      holdCtx.clearRect(0, 0, this.cutHoldCanvas.width, this.cutHoldCanvas.height);
+      holdCtx.drawImage(prevWebgl, 0, 0, this.cutHoldCanvas.width, this.cutHoldCanvas.height);
+
+      const webglCanvas = this.evaluateAtTime(clampedT, shots, timelineCfg);
+      const alpha = Math.max(0, Math.min(1, (clampedT - curShot.start) / cutWindow));
+      ctx.save();
+      ctx.globalAlpha = 1;
+      ctx.drawImage(this.cutHoldCanvas, 0, 0, targetCanvas.width, targetCanvas.height);
+      ctx.globalAlpha = alpha;
+      ctx.drawImage(webglCanvas, 0, 0, targetCanvas.width, targetCanvas.height);
+      ctx.restore();
+    } else {
+      const webglCanvas = this.evaluateAtTime(clampedT, shots, timelineCfg);
+      ctx.drawImage(webglCanvas, 0, 0, targetCanvas.width, targetCanvas.height);
+    }
 
     if (!timelineCfg.showCaptions) return;
 

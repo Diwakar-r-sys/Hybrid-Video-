@@ -24,6 +24,7 @@ import {
   KnownPartBox
 } from './data/presets';
 import {
+  recomputePiecePivotForRole,
   renderSvgPartsToSheet,
   runAutoCutPipeline
 } from './engine/cutoutPipeline';
@@ -44,8 +45,7 @@ import {
 } from './types/studio';
 
 function extractFramesFromVideoFile(
-  objectUrl: string,
-  maxFrames = 8
+  objectUrl: string
 ): Promise<{ duration: number; frames: KeyframeItem[] }> {
   return new Promise((resolve, reject) => {
     const video = document.createElement('video');
@@ -53,34 +53,49 @@ function extractFramesFromVideoFile(
     video.muted = true;
     video.playsInline = true;
 
-    video.onloadedmetadata = async () => {
-      const duration = Math.max(1, Number((video.duration || 2).toFixed(2)));
-      const count = Math.min(maxFrames, Math.max(2, Math.ceil(duration * 1.5)));
-      const frames: KeyframeItem[] = [];
-      const canvas = document.createElement('canvas');
-      const targetW = 360;
-      const ratio = (video.videoHeight || 640) / Math.max(1, video.videoWidth || 360);
-      canvas.width = targetW;
-      canvas.height = Math.round(targetW * ratio);
-      const ctx = canvas.getContext('2d')!;
+    const seekTo = (t: number) =>
+      new Promise<void>((resSeek) => {
+        const onSeeked = () => {
+          video.removeEventListener('seeked', onSeeked);
+          resSeek();
+        };
+        video.addEventListener('seeked', onSeeked);
+        video.currentTime = t;
+      });
 
-      for (let i = 0; i < count; i++) {
-        const ts = Number(((i / Math.max(1, count - 1)) * Math.max(0.1, duration - 0.05)).toFixed(2));
-        await new Promise<void>((resSeek) => {
-          video.onseeked = () => {
-            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-            frames.push({
-              shotId: `extracted-${i + 1}`,
-              shotIndex: i,
-              timestamp: ts,
-              dataUrl: canvas.toDataURL('image/jpeg', 0.82)
-            });
-            resSeek();
-          };
-          video.currentTime = ts;
-        });
+    video.onloadedmetadata = async () => {
+      try {
+        let rawDur = video.duration;
+        if (!Number.isFinite(rawDur) || rawDur <= 0) {
+          await seekTo(1e101);
+          rawDur = video.duration;
+          await seekTo(0);
+        }
+        const duration = Math.max(1, Number((Number.isFinite(rawDur) && rawDur > 0 ? rawDur : 2).toFixed(2)));
+        const count = Math.max(4, Math.min(16, Math.round(duration / 2)));
+        const frames: KeyframeItem[] = [];
+        const canvas = document.createElement('canvas');
+        const targetW = 360;
+        const ratio = (video.videoHeight || 640) / Math.max(1, video.videoWidth || 360);
+        canvas.width = targetW;
+        canvas.height = Math.round(targetW * ratio);
+        const ctx = canvas.getContext('2d')!;
+
+        for (let i = 0; i < count; i++) {
+          const ts = Number(((i / Math.max(1, count - 1)) * Math.max(0.1, duration - 0.05)).toFixed(2));
+          await seekTo(ts);
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          frames.push({
+            shotId: `extracted-${i + 1}`,
+            shotIndex: i,
+            timestamp: ts,
+            dataUrl: canvas.toDataURL('image/jpeg', 0.82)
+          });
+        }
+        resolve({ duration, frames });
+      } catch (err) {
+        reject(err);
       }
-      resolve({ duration, frames });
     };
 
     video.onerror = () => reject(new Error('Could not decode uploaded video file.'));
@@ -543,7 +558,7 @@ export default function App() {
       setUploadedVideoUrl(url);
       setUploadedVideoName(file.name);
       showNotice(`Extracting keyframes from ${file.name}...`, 'info', undefined, originTab);
-      const { duration, frames } = await extractFramesFromVideoFile(url, 10);
+      const { duration, frames } = await extractFramesFromVideoFile(url);
       setKeyframes(frames);
       setTargetDuration(Math.min(66, Math.max(2, Math.round(duration))));
       setHasUnanalyzedUpload(true);
@@ -590,6 +605,7 @@ export default function App() {
       const data = await safeFetchJson<{
         title?: string;
         modelUsed?: string;
+        warnings?: string[];
         uniqueCharacters?: Array<{ name: string; description: string }>;
         shots?: ShotSpec[];
       }>(
@@ -604,7 +620,10 @@ export default function App() {
             youtubeUrl: youtubeUrl.trim(),
             channelId: channelId.trim(),
             duration: targetDuration,
-            frames: keyframes.map((k) => k.dataUrl),
+            frames: keyframes.map((k) => ({
+              dataUrl: k.dataUrl,
+              timestamp: k.timestamp
+            })),
             aspectMode
           })
         },
@@ -624,11 +643,10 @@ export default function App() {
       }
 
       setShots(data.shots);
-      const maxEnd = Math.max(...data.shots.map((s) => s.end));
-      setTimelineConfig((c) => ({ ...c, duration: maxEnd }));
+      setTimelineConfig((c) => ({ ...c, duration: targetDuration }));
       setTimelineSource({
         kind: 'ai',
-        label: data.title || `AI Storyboard (${maxEnd.toFixed(1)}s)`
+        label: data.title || `AI Storyboard (${targetDuration.toFixed(1)}s)`
       });
       setHasUnanalyzedUpload(false);
       setCurrentTime(0);
@@ -650,16 +668,20 @@ export default function App() {
       }
 
       const modelInfo = data.modelUsed ? ` via ${data.modelUsed}` : '';
+      const warningText =
+        Array.isArray(data.warnings) && data.warnings.length > 0
+          ? ` Notes: ${data.warnings.join(' ')}`
+          : '';
       if (failedChars.length > 0) {
         showNotice(
-          `Generated ${data.shots.length}-scene storyboard (${maxEnd.toFixed(1)}s${modelInfo}), but character sheet generation failed for: ${failedChars.join(', ')}. You can retry them in Cutout Rig.`,
+          `Generated ${data.shots.length}-scene storyboard (${targetDuration.toFixed(1)}s${modelInfo}), but character sheet generation failed for: ${failedChars.join(', ')}.${warningText}`,
           'error',
           undefined,
           originTab
         );
       } else {
         showNotice(
-          `Generated ${data.shots.length}-scene 3D storyboard (${maxEnd.toFixed(1)}s${modelInfo}) in channel ${channelId} style.`,
+          `Generated ${data.shots.length}-scene 3D storyboard (${targetDuration.toFixed(1)}s${modelInfo}) in channel ${channelId} style.${warningText}`,
           'info',
           undefined,
           originTab
@@ -780,17 +802,20 @@ export default function App() {
         map.set(item.id, item.role as PieceRole);
       }
 
+      const updatedPieces = await Promise.all(
+        target.pieces.map(async (p) => {
+          const nextRole = map.get(p.id) || p.role;
+          if (nextRole !== p.role) {
+            const pivot = await recomputePiecePivotForRole(p.imageDataUrl, nextRole);
+            return { ...p, role: nextRole, pivotX: pivot.x, pivotY: pivot.y };
+          }
+          return p;
+        })
+      );
+
       setCharacters((prev) =>
         prev.map((ch) =>
-          ch.name === charName
-            ? {
-                ...ch,
-                pieces: ch.pieces.map((p) => ({
-                  ...p,
-                  role: map.get(p.id) || p.role
-                }))
-              }
-            : ch
+          ch.name === charName ? { ...ch, pieces: updatedPieces } : ch
         )
       );
       const modelInfo = data.modelUsed ? ` via ${data.modelUsed}` : '';
@@ -829,6 +854,9 @@ export default function App() {
     try {
       const data = await safeFetchJson<{
         modelUsed?: string;
+        source?: 'gemini-image' | 'gemini-svg-low-quality';
+        qualityWarning?: string;
+        sheetDataUrl?: string;
         partsSvgMap?: Partial<Record<PieceRole, string>>;
       }>(
         '/api/generate-character-sheet',
@@ -848,16 +876,75 @@ export default function App() {
         setLastModelUsed(data.modelUsed);
       }
 
-      const { sheetDataUrl, knownBoxes } = await renderSvgPartsToSheet(
-        data.partsSvgMap || {}
-      );
-      knownLayoutsRef.current.set(charName, knownBoxes);
-      const pieces = await runAutoCutPipeline(
-        sheetDataUrl,
-        timelineConfig.chromaTolerance,
-        timelineConfig.haloWidthPx,
-        knownBoxes
-      );
+      let sheetDataUrl = '';
+      let pieces: CutPiece[] = [];
+      let source: CharacterSheetAsset['source'] = 'gemini-image';
+      let qualityWarning: string | undefined;
+      let autoLabelNote = '';
+
+      if (data.sheetDataUrl) {
+        knownLayoutsRef.current.delete(charName);
+        pieces = await runAutoCutPipeline(
+          data.sheetDataUrl,
+          timelineConfig.chromaTolerance,
+          timelineConfig.haloWidthPx
+        );
+        sheetDataUrl = data.sheetDataUrl;
+        source = 'gemini-image';
+
+        if (pieces.length > 0) {
+          try {
+            setLiveProgressText(`Labeling cutout parts for "${charName}"...`);
+            const labelResp = await safeFetchJson<{
+              assignments?: Array<{ id: string; role: string }>;
+            }>('/api/auto-label-parts', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                pieces: pieces.map((p) => ({
+                  id: p.id,
+                  imageDataUrl: p.imageDataUrl
+                }))
+              })
+            });
+            const roleMap = new Map<string, PieceRole>();
+            for (const item of labelResp.assignments || []) {
+              roleMap.set(item.id, item.role as PieceRole);
+            }
+            if (roleMap.size > 0) {
+              pieces = await Promise.all(
+                pieces.map(async (p) => {
+                  const assignedRole = roleMap.get(p.id) || p.role;
+                  const geomPivot = await recomputePiecePivotForRole(
+                    p.imageDataUrl,
+                    assignedRole
+                  );
+                  return {
+                    ...p,
+                    role: assignedRole,
+                    pivotX: geomPivot.x,
+                    pivotY: geomPivot.y
+                  };
+                })
+              );
+            }
+          } catch {
+            autoLabelNote = ' (auto-labeling skipped; verify part roles manually)';
+          }
+        }
+      } else {
+        const rendered = await renderSvgPartsToSheet(data.partsSvgMap || {});
+        sheetDataUrl = rendered.sheetDataUrl;
+        knownLayoutsRef.current.set(charName, rendered.knownBoxes);
+        pieces = await runAutoCutPipeline(
+          sheetDataUrl,
+          timelineConfig.chromaTolerance,
+          timelineConfig.haloWidthPx,
+          rendered.knownBoxes
+        );
+        source = 'gemini-svg-low-quality';
+        qualityWarning = data.qualityWarning || 'low quality';
+      }
 
       setCharacters((prev) => {
         const exists = prev.some((c) => c.name === charName);
@@ -865,7 +952,8 @@ export default function App() {
           name: charName,
           description,
           sheetDataUrl,
-          source: 'gemini-svg',
+          source,
+          qualityWarning,
           pieces
         };
         return exists
@@ -875,8 +963,9 @@ export default function App() {
       setActiveCharName(charName);
       if (!silentError) {
         const modelInfo = data.modelUsed ? ` via ${data.modelUsed}` : '';
+        const qualityNote = qualityWarning ? ` [${qualityWarning} SVG fallback]` : '';
         showNotice(
-          `Generated rigged paper-cutout sheet for ${charName} (${pieces.length} parts${modelInfo}).`,
+          `Generated rigged paper-cutout sheet for ${charName} (${pieces.length} parts${modelInfo})${qualityNote}${autoLabelNote}.`,
           'info',
           undefined,
           originTab
@@ -983,12 +1072,21 @@ export default function App() {
       a.href = result.blobUrl;
       a.download = result.filename;
       a.click();
-      showNotice(
-        `Exported ${result.filename} (${result.totalFrames} frames).`,
-        'info',
-        undefined,
-        originTab
-      );
+      if (result.audioWarning) {
+        showNotice(
+          `${result.audioWarning} (${result.filename}, ${result.totalFrames} frames).`,
+          'error',
+          undefined,
+          originTab
+        );
+      } else {
+        showNotice(
+          `Exported ${result.filename} (${result.totalFrames} frames).`,
+          'info',
+          undefined,
+          originTab
+        );
+      }
     } catch (err: unknown) {
       setActiveTab('export');
       showNotice(
@@ -1250,6 +1348,13 @@ export default function App() {
                         <option value="16:9">16:9 Video</option>
                       </select>
                     </div>
+                  </div>
+
+                  <div className="text-[11px] font-mono text-slate-400">
+                    Estimated API calls:{' '}
+                    {targetDuration > 30
+                      ? `${Math.ceil(targetDuration / 15)} storyboard chunks (+1 if coverage < 80%, +1 per new character)`
+                      : '1 storyboard call (+1 per new character)'}
                   </div>
 
                   <button

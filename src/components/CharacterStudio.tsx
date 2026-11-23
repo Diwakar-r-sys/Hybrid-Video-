@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Sparkles, Upload, Wand2 } from 'lucide-react';
 import { CharacterSheetAsset, CutPiece, PieceRole } from '../types/studio';
-import { getDefaultPivotForRole } from '../engine/cutoutPipeline';
+import { getDefaultPivotForRole, recomputePiecePivotForRole } from '../engine/cutoutPipeline';
 import { PivotEditor } from './PivotEditor';
 
 interface CharacterStudioProps {
@@ -26,6 +26,10 @@ interface CharacterStudioProps {
 const PIECE_ROLES: PieceRole[] = [
   'Head',
   'Torso',
+  'LeftUpperArm',
+  'LeftForearm',
+  'RightUpperArm',
+  'RightForearm',
   'LeftArm',
   'RightArm',
   'LeftLeg',
@@ -101,13 +105,20 @@ export const CharacterStudio: React.FC<CharacterStudioProps> = ({
         {/* Left: Parts Sheet, Chroma Controls & New Character AI Generator */}
         <div className="lg:col-span-5 space-y-5">
           <div className="rounded-xl border border-slate-800 bg-[#12151d] p-4 space-y-4">
-            <div className="flex items-center justify-between text-xs">
+            <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
               <span className="font-semibold text-slate-200">
                 Active Sheet · {activeChar?.name}
               </span>
-              <span className="font-mono text-slate-400">
-                Source: {activeChar?.source}
-              </span>
+              <div className="flex items-center gap-2">
+                {(activeChar?.source === 'gemini-svg-low-quality' || activeChar?.qualityWarning) && (
+                  <span className="px-2 py-0.5 rounded bg-amber-500/20 border border-amber-500/50 text-amber-300 font-semibold">
+                    {activeChar?.qualityWarning || 'low quality'}
+                  </span>
+                )}
+                <span className="font-mono text-slate-400">
+                  Source: {activeChar?.source}
+                </span>
+              </div>
             </div>
 
             {activeChar?.sheetDataUrl && (
@@ -267,6 +278,15 @@ export const CharacterStudio: React.FC<CharacterStudioProps> = ({
                           pivotX: defPivot.x,
                           pivotY: defPivot.y
                         }));
+                        recomputePiecePivotForRole(piece.imageDataUrl, nextRole).then(
+                          (geomPivot) => {
+                            onUpdatePiece(activeChar.name, piece.id, (p) =>
+                              p.role === nextRole
+                                ? { ...p, pivotX: geomPivot.x, pivotY: geomPivot.y }
+                                : p
+                            );
+                          }
+                        );
                       }}
                       className="w-full bg-[#151822] border border-slate-700 rounded px-1.5 py-1 text-[11px] font-medium text-slate-100"
                     >

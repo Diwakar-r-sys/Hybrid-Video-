@@ -10,6 +10,10 @@ export type EnvironmentPreset =
 export type PieceRole =
   | 'Head'
   | 'Torso'
+  | 'LeftUpperArm'
+  | 'LeftForearm'
+  | 'RightUpperArm'
+  | 'RightForearm'
   | 'LeftArm'
   | 'RightArm'
   | 'LeftLeg'
@@ -17,6 +21,8 @@ export type PieceRole =
   | 'PropNeedles'
   | 'PropScarf'
   | 'Ignore';
+
+export type CharacterAction = 'idle' | 'knit' | 'walk' | 'point' | 'stand_guard';
 
 export interface CaptionWord {
   word: string;
@@ -29,7 +35,7 @@ export interface ShotCharacterState {
   x: number; // world X offset (-1.5 to 1.5)
   scale: number;
   pose: string;
-  action: string;
+  action: CharacterAction;
   knittingSpeed: number;
   armSwingAmp: number;
   headTiltAmp: number;
@@ -93,7 +99,8 @@ export interface CharacterSheetAsset {
   name: string;
   description: string;
   sheetDataUrl: string;
-  source: 'builtin' | 'gemini-svg' | 'uploaded';
+  source: 'builtin' | 'gemini-image' | 'gemini-svg-low-quality' | 'uploaded';
+  qualityWarning?: string;
   pieces: CutPiece[];
 }
 

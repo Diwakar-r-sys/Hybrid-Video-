@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { Plus, Trash2 } from 'lucide-react';
-import { EnvironmentPreset, KeyframeItem, ShotSpec } from '../types/studio';
+import { CharacterAction, EnvironmentPreset, KeyframeItem, ShotSpec } from '../types/studio';
 
 interface StoryboardEditorProps {
   shots: ShotSpec[];
@@ -8,6 +8,14 @@ interface StoryboardEditorProps {
   onChangeShots: (shots: ShotSpec[]) => void;
   onJumpToTime: (t: number) => void;
 }
+
+const ACTION_OPTIONS: Array<{ value: CharacterAction; label: string }> = [
+  { value: 'idle', label: 'idle' },
+  { value: 'knit', label: 'knit' },
+  { value: 'walk', label: 'walk' },
+  { value: 'point', label: 'point' },
+  { value: 'stand_guard', label: 'stand_guard' }
+];
 
 const ENV_OPTIONS: Array<{ value: EnvironmentPreset; label: string }> = [
   { value: 'courtyard', label: 'Brick Courtyard & Archway' },
@@ -94,7 +102,7 @@ export const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
           x: 0,
           scale: 1,
           pose: 'Standing knitting',
-          action: 'Continuous knitting',
+          action: 'knit',
           knittingSpeed: 4.8,
           armSwingAmp: 0.24,
           headTiltAmp: 0.05,
@@ -319,13 +327,37 @@ export const StoryboardEditor: React.FC<StoryboardEditorProps> = ({
                   </div>
                 </div>
 
-                <div className="space-y-1">
-                  <label className="text-slate-400 block">Active Cast &amp; Chair</label>
-                  <div className="flex items-center gap-3 pt-1">
-                    <span className="text-slate-200 truncate">
-                      {shot.characters.map((c) => c.name).join(', ')}
-                    </span>
-                    <label className="inline-flex items-center gap-1.5 text-slate-300 shrink-0 cursor-pointer">
+                <div className="space-y-1.5">
+                  <label className="text-slate-400 block">Active Cast, Action &amp; Chair</label>
+                  <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                    {shot.characters.map((ch, cIdx) => (
+                      <div
+                        key={`${ch.name}-${cIdx}`}
+                        className="inline-flex items-center gap-1.5 bg-[#0d0f14] border border-slate-800 rounded-lg px-2 py-1"
+                      >
+                        <span className="text-slate-200 font-medium">{ch.name}</span>
+                        <select
+                          value={ch.action}
+                          onChange={(e) => {
+                            const nextAction = e.target.value as CharacterAction;
+                            updateShot(idx, (s) => ({
+                              ...s,
+                              characters: s.characters.map((c, i) =>
+                                i === cIdx ? { ...c, action: nextAction } : c
+                              )
+                            }));
+                          }}
+                          className="bg-[#151822] border border-slate-700 rounded px-1.5 py-0.5 text-[11px] font-mono text-amber-300"
+                        >
+                          {ACTION_OPTIONS.map((opt) => (
+                            <option key={opt.value} value={opt.value}>
+                              {opt.label}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    ))}
+                    <label className="inline-flex items-center gap-1.5 text-slate-300 shrink-0 cursor-pointer ml-auto">
                       <input
                         type="checkbox"
                         checked={shot.props.showChair}

@@ -1,5 +1,10 @@
 import { KnownPartBox } from '../data/presets';
 import { CutPiece, PieceRole } from '../types/studio';
+import {
+  computeWhiteHaloPixels,
+  HaloWorkerRequest,
+  HaloWorkerResponse
+} from './haloWorker';
 
 export function loadImage(url: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
@@ -17,10 +22,15 @@ export function getDefaultPivotForRole(role: PieceRole): { x: number; y: number 
       return { x: 0.5, y: 0.88 };
     case 'Torso':
       return { x: 0.5, y: 0.5 };
+    case 'LeftUpperArm':
     case 'LeftArm':
-      return { x: 0.65, y: 0.14 };
+      return { x: 0.55, y: 0.14 };
+    case 'RightUpperArm':
     case 'RightArm':
-      return { x: 0.35, y: 0.14 };
+      return { x: 0.45, y: 0.14 };
+    case 'LeftForearm':
+    case 'RightForearm':
+      return { x: 0.5, y: 0.14 };
     case 'LeftLeg':
       return { x: 0.5, y: 0.1 };
     case 'RightLeg':
@@ -34,6 +44,176 @@ export function getDefaultPivotForRole(role: PieceRole): { x: number; y: number 
   }
 }
 
+/**
+ * Computes joint pivot directly from the piece's actual opaque pixel geometry:
+ * - Head: neck = bottom center of head's opaque pixels
+ * - Arm / UpperArm: shoulder = top center of arm's opaque pixels
+ * - Forearm: elbow = top center of forearm's opaque pixels
+ * - Leg: hip = top center of leg's opaque pixels
+ * - PropScarf: top center suspension anchor
+ * - Torso / PropNeedles: opaque center of mass
+ */
+export function computeGeometryPivot(
+  buffer: Uint8Array | Uint8ClampedArray,
+  width: number,
+  height: number,
+  role: PieceRole,
+  isRgba = false
+): { x: number; y: number } {
+  if (width <= 0 || height <= 0) {
+    return getDefaultPivotForRole(role);
+  }
+
+  let minX = width;
+  let maxX = -1;
+  let minY = height;
+  let maxY = -1;
+  let sumX = 0;
+  let sumY = 0;
+  let count = 0;
+
+  const isOpaque = (x: number, y: number): boolean => {
+    const idx = y * width + x;
+    return isRgba ? buffer[idx * 4 + 3] > 80 : buffer[idx] > 0;
+  };
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (isOpaque(x, y)) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+        sumX += x;
+        sumY += y;
+        count++;
+      }
+    }
+  }
+
+  if (count === 0 || maxX < minX || maxY < minY) {
+    return getDefaultPivotForRole(role);
+  }
+
+  const spanY = Math.max(1, maxY - minY + 1);
+  const bandCenterX = (yFrom: number, yTo: number): number => {
+    let bSum = 0;
+    let bCount = 0;
+    const y0 = Math.max(minY, Math.floor(yFrom));
+    const y1 = Math.min(maxY, Math.ceil(yTo));
+    for (let y = y0; y <= y1; y++) {
+      for (let x = minX; x <= maxX; x++) {
+        if (isOpaque(x, y)) {
+          bSum += x;
+          bCount++;
+        }
+      }
+    }
+    return bCount > 0 ? bSum / bCount : sumX / count;
+  };
+
+  let px: number;
+  let py: number;
+
+  switch (role) {
+    case 'Head': {
+      // Bottom neck center
+      const cx = bandCenterX(maxY - spanY * 0.14, maxY);
+      px = (cx + 0.5) / width;
+      py = (maxY - Math.max(2, spanY * 0.06) + 0.5) / height;
+      break;
+    }
+    case 'LeftUpperArm':
+    case 'RightUpperArm':
+    case 'LeftArm':
+    case 'RightArm': {
+      // Top shoulder center
+      const cx = bandCenterX(minY, minY + spanY * 0.18);
+      px = (cx + 0.5) / width;
+      py = (minY + Math.max(2, spanY * 0.1) + 0.5) / height;
+      break;
+    }
+    case 'LeftForearm':
+    case 'RightForearm': {
+      // Top elbow center
+      const cx = bandCenterX(minY, minY + spanY * 0.16);
+      px = (cx + 0.5) / width;
+      py = (minY + Math.max(2, spanY * 0.09) + 0.5) / height;
+      break;
+    }
+    case 'LeftLeg':
+    case 'RightLeg': {
+      // Top hip center
+      const cx = bandCenterX(minY, minY + spanY * 0.15);
+      px = (cx + 0.5) / width;
+      py = (minY + Math.max(2, spanY * 0.09) + 0.5) / height;
+      break;
+    }
+    case 'PropScarf': {
+      const cx = bandCenterX(minY, minY + spanY * 0.12);
+      px = (cx + 0.5) / width;
+      py = (minY + Math.max(2, spanY * 0.08) + 0.5) / height;
+      break;
+    }
+    default: {
+      px = (sumX / count + 0.5) / width;
+      py = (sumY / count + 0.5) / height;
+      break;
+    }
+  }
+
+  return {
+    x: Number(Math.max(0.05, Math.min(0.95, px)).toFixed(4)),
+    y: Number(Math.max(0.05, Math.min(0.95, py)).toFixed(4))
+  };
+}
+
+export function computePivotFromCanvas(
+  pieceCanvas: HTMLCanvasElement,
+  role: PieceRole
+): { x: number; y: number } {
+  const ctx = pieceCanvas.getContext('2d');
+  if (!ctx) return getDefaultPivotForRole(role);
+  const { width, height } = pieceCanvas;
+  const imgData = ctx.getImageData(0, 0, width, height);
+  return computeGeometryPivot(imgData.data, width, height, role, true);
+}
+
+// Shared Web Worker instance for buildWhiteStickerHaloAsync
+let haloWorkerInstance: Worker | null = null;
+let haloJobSeq = 0;
+const haloPending = new Map<
+  number,
+  { resolve: (buf: Uint8ClampedArray) => void; reject: (err: unknown) => void }
+>();
+
+function getHaloWorker(): Worker | null {
+  if (typeof Worker === 'undefined') return null;
+  if (haloWorkerInstance) return haloWorkerInstance;
+  try {
+    const worker = new Worker(new URL('./haloWorker.ts', import.meta.url), {
+      type: 'module'
+    });
+    worker.onmessage = (event: MessageEvent<HaloWorkerResponse>) => {
+      const entry = haloPending.get(event.data.id);
+      if (!entry) return;
+      haloPending.delete(event.data.id);
+      entry.resolve(new Uint8ClampedArray(event.data.outBuffer));
+    };
+    worker.onerror = (err) => {
+      for (const [, pending] of haloPending) {
+        pending.reject(err);
+      }
+      haloPending.clear();
+      haloWorkerInstance = null;
+    };
+    haloWorkerInstance = worker;
+    return worker;
+  } catch {
+    return null;
+  }
+}
+
 export function buildWhiteStickerHalo(
   pieceCanvas: HTMLCanvasElement,
   radius: number
@@ -42,59 +222,58 @@ export function buildWhiteStickerHalo(
   const h = pieceCanvas.height;
   const srcCtx = pieceCanvas.getContext('2d')!;
   const srcData = srcCtx.getImageData(0, 0, w, h).data;
+  const haloPixels = computeWhiteHaloPixels(srcData, w, h, radius);
 
   const haloCanvas = document.createElement('canvas');
   haloCanvas.width = w;
   haloCanvas.height = h;
   const hCtx = haloCanvas.getContext('2d')!;
-  const outData = hCtx.createImageData(w, h);
-
-  const rSq = radius * radius;
-  const softR = radius + 1.5;
-  const softRSq = softR * softR;
-
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      let minDistSq = Infinity;
-      const y0 = Math.max(0, y - Math.ceil(softR));
-      const y1 = Math.min(h - 1, y + Math.ceil(softR));
-      const x0 = Math.max(0, x - Math.ceil(softR));
-      const x1 = Math.min(w - 1, x + Math.ceil(softR));
-
-      for (let ny = y0; ny <= y1; ny++) {
-        const dy = ny - y;
-        for (let nx = x0; nx <= x1; nx++) {
-          const dx = nx - x;
-          const dSq = dx * dx + dy * dy;
-          if (dSq <= softRSq && dSq < minDistSq) {
-            const a = srcData[(ny * w + nx) * 4 + 3];
-            if (a > 120) {
-              minDistSq = dSq;
-              if (minDistSq <= rSq) break;
-            }
-          }
-        }
-        if (minDistSq <= rSq) break;
-      }
-
-      if (minDistSq <= softRSq) {
-        const idx = (y * w + x) * 4;
-        const dist = Math.sqrt(minDistSq);
-        const alpha =
-          dist <= radius
-            ? 255
-            : Math.max(0, Math.round(255 * (1 - (dist - radius) / 1.5)));
-        outData.data[idx] = 255;
-        outData.data[idx + 1] = 255;
-        outData.data[idx + 2] = 255;
-        outData.data[idx + 3] = alpha;
-      }
-    }
-  }
-
+  const outData = new ImageData(new Uint8ClampedArray(haloPixels), w, h);
   hCtx.putImageData(outData, 0, 0);
   hCtx.drawImage(pieceCanvas, 0, 0);
   return haloCanvas;
+}
+
+export async function buildWhiteStickerHaloAsync(
+  pieceCanvas: HTMLCanvasElement,
+  radius: number
+): Promise<HTMLCanvasElement> {
+  const w = pieceCanvas.width;
+  const h = pieceCanvas.height;
+  const srcCtx = pieceCanvas.getContext('2d')!;
+  const srcData = srcCtx.getImageData(0, 0, w, h).data;
+
+  const worker = getHaloWorker();
+  if (!worker) {
+    return buildWhiteStickerHalo(pieceCanvas, radius);
+  }
+
+  try {
+    const id = ++haloJobSeq;
+    const copy = new Uint8ClampedArray(srcData);
+    const haloPixels = await new Promise<Uint8ClampedArray>((resolve, reject) => {
+      haloPending.set(id, { resolve, reject });
+      const req: HaloWorkerRequest = {
+        id,
+        width: w,
+        height: h,
+        radius,
+        rgbaBuffer: copy.buffer as ArrayBuffer
+      };
+      worker.postMessage(req, [copy.buffer]);
+    });
+
+    const haloCanvas = document.createElement('canvas');
+    haloCanvas.width = w;
+    haloCanvas.height = h;
+    const hCtx = haloCanvas.getContext('2d')!;
+    const outData = new ImageData(new Uint8ClampedArray(haloPixels), w, h);
+    hCtx.putImageData(outData, 0, 0);
+    hCtx.drawImage(pieceCanvas, 0, 0);
+    return haloCanvas;
+  } catch {
+    return buildWhiteStickerHalo(pieceCanvas, radius);
+  }
 }
 
 function chromaKeyBuffer(
@@ -170,7 +349,7 @@ export async function runAutoCutPipeline(
   const mask = chromaKeyBuffer(data, w, h, tolerance);
   srcCtx.putImageData(imgData, 0, 0);
 
-  // If we have exact knownBoxes (e.g., from built-in sheet or Gemini SVG sheet), extract deterministically!
+  // If we have exact knownBoxes (e.g., from built-in sheet or Gemini SVG sheet), extract deterministically
   if (knownBoxes && knownBoxes.length > 0) {
     const pieces: CutPiece[] = [];
     for (let idx = 0; idx < knownBoxes.length; idx++) {
@@ -181,11 +360,10 @@ export async function runAutoCutPipeline(
       const sw = Math.min(w - sx, Math.ceil(box.w));
       const sh = Math.min(h - sy, Math.ceil(box.h));
 
-      // Tighten crop to actual non-transparent pixels inside box
-      let minX = sw,
-        maxX = -1,
-        minY = sh,
-        maxY = -1;
+      let minX = sw;
+      let maxX = -1;
+      let minY = sh;
+      let maxY = -1;
       for (let py = 0; py < sh; py++) {
         for (let px = 0; px < sw; px++) {
           const gi = (sy + py) * w + (sx + px);
@@ -220,7 +398,8 @@ export async function runAutoCutPipeline(
         tightH
       );
 
-      const haloCanvas = buildWhiteStickerHalo(pieceCanvas, haloRadius);
+      const haloCanvas = await buildWhiteStickerHaloAsync(pieceCanvas, haloRadius);
+      const geomPivot = computePivotFromCanvas(pieceCanvas, box.role);
 
       pieces.push({
         id: `piece_${idx + 1}`,
@@ -229,8 +408,8 @@ export async function runAutoCutPipeline(
         haloDataUrl: haloCanvas.toDataURL('image/png'),
         width: cw,
         height: ch,
-        pivotX: box.pivotX,
-        pivotY: box.pivotY,
+        pivotX: geomPivot.x,
+        pivotY: geomPivot.y,
         bbox: {
           minX: sx + minX,
           minY: sy + minY,
@@ -242,7 +421,7 @@ export async function runAutoCutPipeline(
     return pieces;
   }
 
-  // Fallback for arbitrary uploaded sheets: BFS connected components
+  // BFS connected components for generated image / uploaded #FF00FF sheets
   const visited = new Uint8Array(w * h);
   const queue = new Int32Array(w * h);
   interface Comp {
@@ -267,10 +446,10 @@ export async function runAutoCutPipeline(
         queue[tail++] = startIdx;
         visited[startIdx] = 1;
 
-        let minX = x,
-          maxX = x,
-          minY = y,
-          maxY = y;
+        let minX = x;
+        let maxX = x;
+        let minY = y;
+        let maxY = y;
         const pixels: number[] = [];
 
         while (head < tail) {
@@ -320,7 +499,9 @@ export async function runAutoCutPipeline(
   });
 
   const pad = haloRadius + 10;
-  return components.map((comp, idx) => {
+  const results: CutPiece[] = [];
+  for (let idx = 0; idx < components.length; idx++) {
+    const comp = components[idx];
     const role = inferRoleHeuristic(comp.centerX, comp.centerY, comp.width, comp.height);
     const cw = comp.width + pad * 2;
     const ch = comp.height + pad * 2;
@@ -347,31 +528,53 @@ export async function runAutoCutPipeline(
     }
     pCtx.putImageData(pieceImg, 0, 0);
 
-    const haloCanvas = buildWhiteStickerHalo(pieceCanvas, haloRadius);
-    const pivot = getDefaultPivotForRole(role);
+    const haloCanvas = await buildWhiteStickerHaloAsync(pieceCanvas, haloRadius);
+    const geomPivot = computePivotFromCanvas(pieceCanvas, role);
 
-    return {
+    results.push({
       id: `piece_${idx + 1}`,
       role,
       imageDataUrl: pieceCanvas.toDataURL('image/png'),
       haloDataUrl: haloCanvas.toDataURL('image/png'),
       width: cw,
       height: ch,
-      pivotX: pivot.x,
-      pivotY: pivot.y,
+      pivotX: geomPivot.x,
+      pivotY: geomPivot.y,
       bbox: {
         minX: comp.minX,
         minY: comp.minY,
         width: comp.width,
         height: comp.height
       }
-    };
-  });
+    });
+  }
+  return results;
 }
 
 /**
- * Converts a Gemini-generated SVG parts dictionary (one SVG per role or one
- * multi-group SVG) onto a 1024x1024 #FF00FF sheet with exact bounding boxes.
+ * Re-computes geometry pivot for an existing CutPiece imageDataUrl when its role changes.
+ */
+export async function recomputePiecePivotForRole(
+  imageDataUrl: string,
+  role: PieceRole
+): Promise<{ x: number; y: number }> {
+  try {
+    const img = await loadImage(imageDataUrl);
+    const c = document.createElement('canvas');
+    c.width = img.width;
+    c.height = img.height;
+    const ctx = c.getContext('2d');
+    if (!ctx) return getDefaultPivotForRole(role);
+    ctx.drawImage(img, 0, 0);
+    return computePivotFromCanvas(c, role);
+  } catch {
+    return getDefaultPivotForRole(role);
+  }
+}
+
+/**
+ * Converts a Gemini-generated SVG parts dictionary (last-resort fallback)
+ * onto a 1024x1024 #FF00FF sheet with exact bounding boxes.
  */
 export async function renderSvgPartsToSheet(
   partsSvgMap: Partial<Record<PieceRole, string>>

@@ -12,19 +12,32 @@ export interface ExportResult {
   filename: string;
   totalFrames: number;
   hasEmbeddedAudio: boolean;
+  audioWarning?: string;
 }
+
+type AudioEncodeAttempt =
+  | {
+      ok: true;
+      track: {
+        codec: 'aac' | 'opus';
+        sampleRate: number;
+        numberOfChannels: number;
+        chunks: Array<{ chunk: EncodedAudioChunk; meta?: EncodedAudioChunkMetadata }>;
+      };
+    }
+  | {
+      ok: false;
+      warning: string;
+    };
+
+const AUDIO_ENCODE_WARNING = 'Exported silent MP4, audio could not be encoded';
 
 async function tryEncodeAudioTrack(
   audioDataUrl: string,
   durationSec: number
-): Promise<{
-  codec: 'aac' | 'opus';
-  sampleRate: number;
-  numberOfChannels: number;
-  chunks: Array<{ chunk: EncodedAudioChunk; meta?: EncodedAudioChunkMetadata }>;
-} | null> {
+): Promise<AudioEncodeAttempt> {
   if (typeof AudioEncoder === 'undefined' || typeof AudioData === 'undefined') {
-    return null;
+    return { ok: false, warning: AUDIO_ENCODE_WARNING };
   }
 
   try {
@@ -61,7 +74,9 @@ async function tryEncodeAudioTrack(
       }
     }
 
-    if (!selectedCodec) return null;
+    if (!selectedCodec) {
+      return { ok: false, warning: AUDIO_ENCODE_WARNING };
+    }
 
     const encodedChunks: Array<{
       chunk: EncodedAudioChunk;
@@ -106,14 +121,17 @@ async function tryEncodeAudioTrack(
     encoder.close();
 
     return {
-      codec: selectedCodec,
-      sampleRate: 48000,
-      numberOfChannels: 1,
-      chunks: encodedChunks
+      ok: true,
+      track: {
+        codec: selectedCodec,
+        sampleRate: 48000,
+        numberOfChannels: 1,
+        chunks: encodedChunks
+      }
     };
   } catch (err) {
     console.warn('Skipping embedded audio encoding:', err);
-    return null;
+    return { ok: false, warning: AUDIO_ENCODE_WARNING };
   }
 }
 
@@ -140,9 +158,12 @@ export async function exportDeterministicMp4(
 
   onProgress({ percent: 2, message: 'Preparing MP4 muxer & encoder...' });
 
-  const encodedAudio = audioDataUrl
+  const audioAttempt = audioDataUrl
     ? await tryEncodeAudioTrack(audioDataUrl, duration)
     : null;
+  const encodedAudio = audioAttempt && audioAttempt.ok ? audioAttempt.track : null;
+  const audioWarning =
+    audioAttempt && !audioAttempt.ok ? audioAttempt.warning : undefined;
 
   const muxer = new Muxer({
     target: new ArrayBufferTarget(),
@@ -254,13 +275,16 @@ export async function exportDeterministicMp4(
 
   onProgress({
     percent: 100,
-    message: `Ready: ${filename} (${totalFrames} frames @ ${fps}fps)`
+    message: audioWarning
+      ? `${audioWarning} — ${filename} (${totalFrames} frames @ ${fps}fps)`
+      : `Ready: ${filename} (${totalFrames} frames @ ${fps}fps)`
   });
 
   return {
     blobUrl,
     filename,
     totalFrames,
-    hasEmbeddedAudio: Boolean(encodedAudio)
+    hasEmbeddedAudio: Boolean(encodedAudio),
+    ...(audioWarning ? { audioWarning } : {})
   };
 }
