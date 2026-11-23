@@ -1,0 +1,6 @@
+{
+  "name": "CutoutStage 3D — Hybrid Video Reconstruction Studio",
+  "description": "Transform reference videos, YouTube Shorts, or story prompts into deterministic Three.js 3D environments with rigged 2D paper-cutout characters, white sticker halos, dynamic 3D props, and YouTube-ready MP4 export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
