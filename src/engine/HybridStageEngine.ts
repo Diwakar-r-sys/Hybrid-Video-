@@ -1539,6 +1539,15 @@ export class HybridStageEngine {
     ctx.restore();
   }
 
+  public renderFrame(
+    t: number,
+    targetCanvas: HTMLCanvasElement,
+    shots: ShotSpec[],
+    timelineCfg: TimelineConfig
+  ): void {
+    this.renderCompositeFrame(targetCanvas, t, shots, timelineCfg);
+  }
+
   public dispose(): void {
     if (this.disposed) return;
     this.disposed = true;

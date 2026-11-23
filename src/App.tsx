@@ -13,7 +13,7 @@ import {
 import { CharacterStudio } from './components/CharacterStudio';
 import { ExportStudio } from './components/ExportStudio';
 import { StoryboardEditor } from './components/StoryboardEditor';
-import { ServerModelHealth, TopBar, WorkspaceTab } from './components/TopBar';
+import { TopBar, WorkspaceTab } from './components/TopBar';
 import {
   BUILTIN_PRESETS,
   CHANNEL_REFERENCE_ID,
@@ -305,55 +305,38 @@ export default function App() {
   // Async & Export State
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isCharBusy, setIsCharBusy] = useState(false);
-  const [isGeneratingTts, setIsGeneratingTts] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
-  const [audioDataUrl, setAudioDataUrl] = useState<string | null>(null);
   const [exportProgress, setExportProgress] = useState<ExportProgress | null>(null);
   const [exportResult, setExportResult] = useState<ExportResult | null>(null);
   const [lastModelUsed, setLastModelUsed] = useState<string | null>(null);
-  const [modelHealth, setModelHealth] = useState<ServerModelHealth | null>(null);
   const [liveProgressText, setLiveProgressText] = useState<string | null>(null);
   const [statusNotice, setStatusNotice] = useState<{
     tab: WorkspaceTab;
-    type: 'info' | 'error';
     text: string;
-    retryAction?: 'analyze' | 'tts' | 'auto-label' | 'generate-sheet';
   } | null>(null);
 
   const engineRef = useRef<HybridStageEngine | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
   const knownLayoutsRef = useRef<Map<string, KnownPartBox[]>>(new Map());
   const activeTabRef = useRef<WorkspaceTab>(activeTab);
   activeTabRef.current = activeTab;
 
-  const lastTtsVoiceRef = useRef<string>('Kore');
-  const lastAutoLabelCharRef = useRef<string>('Grandma');
-  const lastGenSheetParamsRef = useRef<{ name: string; description: string } | null>(null);
-
   const showNotice = useCallback(
-    (
-      text: string,
-      type: 'info' | 'error' = 'info',
-      retryAction?: 'analyze' | 'tts' | 'auto-label' | 'generate-sheet',
-      tabOverride?: WorkspaceTab
-    ) => {
+    (text: string, tabOverride?: WorkspaceTab) => {
       setStatusNotice({
         tab: tabOverride ?? activeTabRef.current,
-        type,
-        text,
-        retryAction
+        text
       });
     },
     []
   );
 
-  // Auto-dismiss success/info notices after 6s
+  // Auto-dismiss non-blocking notices after 5s
   useEffect(() => {
-    if (!statusNotice || statusNotice.type !== 'info') return;
+    if (!statusNotice) return;
     const timer = window.setTimeout(() => {
       setStatusNotice((prev) => (prev === statusNotice ? null : prev));
-    }, 6000);
+    }, 5000);
     return () => window.clearTimeout(timer);
   }, [statusNotice]);
 
@@ -362,16 +345,30 @@ export default function App() {
     setActiveTab(nextTab);
   }, []);
 
-  // Fetch discovered model lists & health warnings on mount
+  // Log server model availability quietly to developer console without blocking the UI
   useEffect(() => {
     let cancelled = false;
-    safeFetchJson<ServerModelHealth>('/api/health')
+    safeFetchJson<{
+      hasApiKey?: boolean;
+      apiKeyError?: string;
+      models?: { TEXT_MODELS?: string[] };
+    }>('/api/health')
       .then((health) => {
-        if (!cancelled && health?.models) {
-          setModelHealth(health);
+        if (cancelled || !health) return;
+        if (!health.hasApiKey) {
+          console.warn(
+            '[CutoutStage API] Running in local deterministic Canvas/Three.js mode:',
+            health.apiKeyError || 'GEMINI_API_KEY is not configured.'
+          );
+        } else {
+          console.debug('[CutoutStage API] Active TEXT_MODELS:', health.models?.TEXT_MODELS);
         }
       })
-      .catch(() => {});
+      .catch((err) => {
+        if (!cancelled) {
+          console.debug('[CutoutStage API] Health check skipped:', err);
+        }
+      });
     return () => {
       cancelled = true;
     };
@@ -463,7 +460,7 @@ export default function App() {
         await engine.setCharacterRig(ch.name, ch.pieces);
       }
       if (!cancelled && canvasRef.current) {
-        engine.renderCompositeFrame(canvasRef.current, currentTime, shots, timelineConfig);
+        engine.renderFrame(currentTime, canvasRef.current, shots, timelineConfig);
       }
     };
     uploadRigs();
@@ -478,7 +475,7 @@ export default function App() {
     if (!engine) return;
     engine.setDimensionsForAspect(aspectMode, true);
     if (canvasRef.current) {
-      engine.renderCompositeFrame(canvasRef.current, currentTime, shots, timelineConfig);
+      engine.renderFrame(currentTime, canvasRef.current, shots, timelineConfig);
     }
   }, [aspectMode]);
 
@@ -487,24 +484,14 @@ export default function App() {
     const engine = engineRef.current;
     const canvas = canvasRef.current;
     if (!engine || !canvas || !rigsReady || contextLost) return;
-    engine.renderCompositeFrame(canvas, currentTime, shots, timelineConfig);
+    engine.renderFrame(currentTime, canvas, shots, timelineConfig);
   }, [currentTime, shots, timelineConfig, rigsReady, contextLost, activeTab]);
 
   // 6. Deterministic Playback Loop (paced on software WebGL)
   useEffect(() => {
-    if (!isPlaying) {
-      if (audioRef.current) {
-        audioRef.current.pause();
-      }
-      return;
-    }
+    if (!isPlaying) return;
 
     const engine = engineRef.current;
-    if (audioRef.current && audioDataUrl) {
-      audioRef.current.currentTime = currentTime;
-      audioRef.current.play().catch(() => {});
-    }
-
     let frameId = 0;
     let lastNow: number | null = null;
     const isSoft = engine?.isSoftwareGl ?? false;
@@ -518,9 +505,6 @@ export default function App() {
         let next = prev + dt;
         if (next >= timelineConfig.duration) {
           next = 0;
-          if (audioRef.current && audioDataUrl) {
-            audioRef.current.currentTime = 0;
-          }
         }
         return next;
       });
@@ -537,7 +521,7 @@ export default function App() {
       cancelAnimationFrame(frameId);
       clearTimeout(frameId);
     };
-  }, [isPlaying, timelineConfig.duration, audioDataUrl]);
+  }, [isPlaying, timelineConfig.duration]);
 
   const applyPreset = (presetId: string) => {
     const preset = BUILTIN_PRESETS.find((p) => p.id === presetId);
@@ -573,24 +557,19 @@ export default function App() {
       const url = URL.createObjectURL(file);
       setUploadedVideoUrl(url);
       setUploadedVideoName(file.name);
-      showNotice(`Extracting keyframes from ${file.name}...`, 'info', undefined, originTab);
+      showNotice(`Extracting keyframes from ${file.name}...`, originTab);
       const { duration, frames } = await extractFramesFromVideoFile(url);
       setKeyframes(frames);
       setTargetDuration(Math.min(66, Math.max(2, Math.round(duration))));
       setHasUnanalyzedUpload(true);
       showNotice(
         `Extracted ${frames.length} keyframes (${duration.toFixed(1)}s) from ${file.name}. Click "Generate 3D Storyboard & Animation" to build the ${Math.round(duration)}s timeline.`,
-        'info',
-        undefined,
         originTab
       );
     } catch (err: unknown) {
-      showNotice(
-        err instanceof Error ? err.message : 'Failed to read video file.',
-        'error',
-        undefined,
-        originTab
-      );
+      const msg = err instanceof Error ? err.message : 'Failed to read video file.';
+      console.warn('[CutoutStage Video]', msg);
+      showNotice(msg, originTab);
     }
   };
 
@@ -689,28 +668,25 @@ export default function App() {
           ? ` Notes: ${data.warnings.join(' ')}`
           : '';
       if (failedChars.length > 0) {
+        console.warn('[CutoutStage API] Partial character sheet skip:', failedChars);
         showNotice(
-          `Generated ${data.shots.length}-scene storyboard (${targetDuration.toFixed(1)}s${modelInfo}), but character sheet generation failed for: ${failedChars.join(', ')}.${warningText}`,
-          'error',
-          undefined,
+          `Generated ${data.shots.length}-scene storyboard (${targetDuration.toFixed(1)}s${modelInfo}). Skipped custom sheet for: ${failedChars.join(', ')}.${warningText}`,
           originTab
         );
       } else {
         showNotice(
           `Generated ${data.shots.length}-scene 3D storyboard (${targetDuration.toFixed(1)}s${modelInfo}) in channel ${channelId} style.${warningText}`,
-          'info',
-          undefined,
           originTab
         );
       }
     } catch (err: unknown) {
+      const code = err instanceof ApiRequestError ? err.code : 500;
       const retryable = err instanceof ApiRequestError ? err.retryable : false;
       const msg =
         err instanceof Error ? err.message : 'Storyboard generation failed.';
+      console.warn('[CutoutStage API] Storyboard analysis error:', { code, retryable, msg });
       showNotice(
-        `${msg} (Active timeline remained "${timelineSource.label}".)`,
-        'error',
-        retryable ? 'analyze' : undefined,
+        `Gemini API unavailable (${code}): active timeline "${timelineSource.label}" continues smoothly.`,
         originTab
       );
     } finally {
@@ -772,9 +748,7 @@ export default function App() {
         )
       );
       showNotice(
-        `Segmented ${pieces.length} pieces from custom #FF00FF sheet for ${charName}. Click AI Auto-Label Limbs if any roles need adjustment.`,
-        'info',
-        undefined,
+        `Segmented ${pieces.length} pieces from custom #FF00FF sheet for ${charName}.`,
         originTab
       );
     } finally {
@@ -786,7 +760,6 @@ export default function App() {
     const target = characters.find((c) => c.name === charName);
     if (!target || target.pieces.length === 0) return;
     const originTab = activeTabRef.current;
-    lastAutoLabelCharRef.current = charName;
     setStatusNotice(null);
     setLiveProgressText(null);
     setIsCharBusy(true);
@@ -837,16 +810,14 @@ export default function App() {
       const modelInfo = data.modelUsed ? ` via ${data.modelUsed}` : '';
       showNotice(
         `AI Vision labeled ${map.size} cutout limbs for ${charName}${modelInfo}.`,
-        'info',
-        undefined,
         originTab
       );
     } catch (err: unknown) {
-      const retryable = err instanceof ApiRequestError ? err.retryable : false;
+      const code = err instanceof ApiRequestError ? err.code : 500;
+      const msg = err instanceof Error ? err.message : 'Auto-label request failed.';
+      console.warn('[CutoutStage API] Auto-label error:', { code, msg });
       showNotice(
-        err instanceof Error ? err.message : 'Auto-label request failed.',
-        'error',
-        retryable ? 'auto-label' : undefined,
+        `Auto-label skipped (${code}): existing cutout limb pivots preserved.`,
         originTab
       );
     } finally {
@@ -861,7 +832,6 @@ export default function App() {
     silentError = false
   ): Promise<boolean> => {
     const originTab = activeTabRef.current;
-    lastGenSheetParamsRef.current = { name: charName, description };
     if (!silentError) {
       setStatusNotice(null);
     }
@@ -870,9 +840,7 @@ export default function App() {
     try {
       const data = await safeFetchJson<{
         modelUsed?: string;
-        source?: 'gemini-image' | 'gemini-svg-low-quality';
-        qualityWarning?: string;
-        sheetDataUrl?: string;
+        source?: 'gemini-svg';
         partsSvgMap?: Partial<Record<PieceRole, string>>;
       }>(
         '/api/generate-character-sheet',
@@ -892,84 +860,22 @@ export default function App() {
         setLastModelUsed(data.modelUsed);
       }
 
-      let sheetDataUrl = '';
-      let pieces: CutPiece[] = [];
-      let source: CharacterSheetAsset['source'] = 'gemini-image';
-      let qualityWarning: string | undefined;
-      let autoLabelNote = '';
-
-      if (data.sheetDataUrl) {
-        knownLayoutsRef.current.delete(charName);
-        pieces = await runAutoCutPipeline(
-          data.sheetDataUrl,
-          timelineConfig.chromaTolerance,
-          timelineConfig.haloWidthPx
-        );
-        sheetDataUrl = data.sheetDataUrl;
-        source = 'gemini-image';
-
-        if (pieces.length > 0) {
-          try {
-            setLiveProgressText(`Labeling cutout parts for "${charName}"...`);
-            const labelResp = await safeFetchJson<{
-              assignments?: Array<{ id: string; role: string }>;
-            }>('/api/auto-label-parts', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                pieces: pieces.map((p) => ({
-                  id: p.id,
-                  imageDataUrl: p.imageDataUrl
-                }))
-              })
-            });
-            const roleMap = new Map<string, PieceRole>();
-            for (const item of labelResp.assignments || []) {
-              roleMap.set(item.id, item.role as PieceRole);
-            }
-            if (roleMap.size > 0) {
-              pieces = await Promise.all(
-                pieces.map(async (p) => {
-                  const assignedRole = roleMap.get(p.id) || p.role;
-                  const geomPivot = await recomputePiecePivotForRole(
-                    p.imageDataUrl,
-                    assignedRole
-                  );
-                  return {
-                    ...p,
-                    role: assignedRole,
-                    pivotX: geomPivot.x,
-                    pivotY: geomPivot.y
-                  };
-                })
-              );
-            }
-          } catch {
-            autoLabelNote = ' (auto-labeling skipped; verify part roles manually)';
-          }
-        }
-      } else {
-        const rendered = await renderSvgPartsToSheet(data.partsSvgMap || {});
-        sheetDataUrl = rendered.sheetDataUrl;
-        knownLayoutsRef.current.set(charName, rendered.knownBoxes);
-        pieces = await runAutoCutPipeline(
-          sheetDataUrl,
-          timelineConfig.chromaTolerance,
-          timelineConfig.haloWidthPx,
-          rendered.knownBoxes
-        );
-        source = 'gemini-svg-low-quality';
-        qualityWarning = data.qualityWarning || 'low quality';
-      }
+      const rendered = await renderSvgPartsToSheet(data.partsSvgMap || {});
+      knownLayoutsRef.current.set(charName, rendered.knownBoxes);
+      const pieces = await runAutoCutPipeline(
+        rendered.sheetDataUrl,
+        timelineConfig.chromaTolerance,
+        timelineConfig.haloWidthPx,
+        rendered.knownBoxes
+      );
 
       setCharacters((prev) => {
         const exists = prev.some((c) => c.name === charName);
         const nextChar: CharacterSheetAsset = {
           name: charName,
           description,
-          sheetDataUrl,
-          source,
-          qualityWarning,
+          sheetDataUrl: rendered.sheetDataUrl,
+          source: 'gemini-svg',
           pieces
         };
         return exists
@@ -979,22 +885,19 @@ export default function App() {
       setActiveCharName(charName);
       if (!silentError) {
         const modelInfo = data.modelUsed ? ` via ${data.modelUsed}` : '';
-        const qualityNote = qualityWarning ? ` [${qualityWarning} SVG fallback]` : '';
         showNotice(
-          `Generated rigged paper-cutout sheet for ${charName} (${pieces.length} parts${modelInfo})${qualityNote}${autoLabelNote}.`,
-          'info',
-          undefined,
+          `Generated rigged paper-cutout sheet for ${charName} (${pieces.length} SVG parts${modelInfo}).`,
           originTab
         );
       }
       return true;
     } catch (err: unknown) {
+      const code = err instanceof ApiRequestError ? err.code : 500;
+      const msg = err instanceof Error ? err.message : 'Character sheet generation failed.';
+      console.warn('[CutoutStage API] Character sheet generation error:', { charName, code, msg });
       if (!silentError) {
-        const retryable = err instanceof ApiRequestError ? err.retryable : false;
         showNotice(
-          err instanceof Error ? err.message : 'Character sheet generation failed.',
-          'error',
-          retryable ? 'generate-sheet' : undefined,
+          `Could not generate sheet for ${charName} (${code}); built-in rigs remain active.`,
           originTab
         );
       }
@@ -1005,58 +908,12 @@ export default function App() {
     }
   };
 
-  const handleGenerateTts = async (voiceName: string) => {
-    const narration = shots
-      .map((s) => s.narrationText)
-      .filter(Boolean)
-      .join(' ');
-    if (!narration) return;
-    const originTab = activeTabRef.current;
-    lastTtsVoiceRef.current = voiceName;
-    setStatusNotice(null);
-    setLiveProgressText(null);
-    setIsGeneratingTts(true);
-    try {
-      const data = await safeFetchJson<{ audioDataUrl: string; modelUsed?: string }>(
-        '/api/tts',
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: narration, voiceName })
-        },
-        (msg) => setLiveProgressText(msg)
-      );
-      if (data.modelUsed) {
-        setLastModelUsed(data.modelUsed);
-      }
-      setAudioDataUrl(data.audioDataUrl);
-      const modelInfo = data.modelUsed ? ` via ${data.modelUsed}` : '';
-      showNotice(
-        `Voiceover WAV generated${modelInfo} and synced to stage playback.`,
-        'info',
-        undefined,
-        originTab
-      );
-    } catch (err: unknown) {
-      const retryable = err instanceof ApiRequestError ? err.retryable : false;
-      showNotice(
-        err instanceof Error ? err.message : 'TTS generation failed.',
-        'error',
-        retryable ? 'tts' : undefined,
-        originTab
-      );
-    } finally {
-      setIsGeneratingTts(false);
-      setLiveProgressText(null);
-    }
-  };
-
   const handleSaveFramePng = () => {
     setStatusNotice(null);
     const canvas = canvasRef.current;
     const engine = engineRef.current;
     if (!canvas || !engine) return;
-    engine.renderCompositeFrame(canvas, currentTime, shots, timelineConfig);
+    engine.renderFrame(currentTime, canvas, shots, timelineConfig);
     const link = document.createElement('a');
     link.download = `cutoutstage_t_${currentTime.toFixed(2)}s.png`;
     link.href = canvas.toDataURL('image/png');
@@ -1079,7 +936,7 @@ export default function App() {
         shots,
         timelineConfig,
         aspectMode,
-        audioDataUrl,
+        null,
         (prog) => setExportProgress(prog)
       );
       setExportResult(result);
@@ -1088,36 +945,22 @@ export default function App() {
       a.href = result.blobUrl;
       a.download = result.filename;
       a.click();
-      if (result.audioWarning) {
-        showNotice(
-          `${result.audioWarning} (${result.filename}, ${result.totalFrames} frames).`,
-          'error',
-          undefined,
-          originTab
-        );
-      } else {
-        showNotice(
-          `Exported ${result.filename} (${result.totalFrames} frames).`,
-          'info',
-          undefined,
-          originTab
-        );
-      }
-    } catch (err: unknown) {
-      setActiveTab('export');
       showNotice(
-        err instanceof Error ? err.message : 'MP4 export failed.',
-        'error',
-        undefined,
-        'export'
+        `Exported ${result.filename} (${result.totalFrames} frames).`,
+        originTab
       );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'MP4 export failed.';
+      console.warn('[CutoutStage Export]', msg);
+      setActiveTab('export');
+      showNotice(msg, 'export');
     } finally {
       setIsExporting(false);
       // Restore preview frame
       if (canvasRef.current && engineRef.current) {
-        engineRef.current.renderCompositeFrame(
-          canvasRef.current,
+        engineRef.current.renderFrame(
           currentTime,
+          canvasRef.current,
           shots,
           timelineConfig
         );
@@ -1136,12 +979,7 @@ export default function App() {
         onQuickExport={handleExportMp4}
         isExporting={isExporting}
         modelUsed={lastModelUsed}
-        modelHealth={modelHealth}
       />
-
-      {audioDataUrl && (
-        <audio ref={audioRef} src={audioDataUrl} className="hidden" />
-      )}
 
       {liveProgressText && (
         <div className="mx-auto max-w-[1440px] w-full px-6 pt-4">
@@ -1153,48 +991,15 @@ export default function App() {
 
       {statusNotice && statusNotice.tab === activeTab && (
         <div className="mx-auto max-w-[1440px] w-full px-6 pt-4">
-          <div
-            className={`flex flex-wrap items-center justify-between gap-4 rounded-xl border px-4 py-2.5 text-xs ${
-              statusNotice.type === 'error'
-                ? 'border-rose-800/70 bg-rose-950/35 text-rose-200'
-                : 'border-slate-800 bg-[#141822] text-slate-200'
-            }`}
-          >
+          <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-slate-800 bg-[#141822] px-4 py-2.5 text-xs text-slate-200">
             <span className="flex-1 min-w-[220px]">{statusNotice.text}</span>
-            <div className="flex items-center gap-2 shrink-0">
-              {statusNotice.type === 'error' && statusNotice.retryAction && (
-                <button
-                  type="button"
-                  disabled={isAnalyzing || isCharBusy || isGeneratingTts}
-                  onClick={() => {
-                    const action = statusNotice.retryAction;
-                    if (action === 'analyze') {
-                      handleGenerateStoryboard();
-                    } else if (action === 'tts') {
-                      handleGenerateTts(lastTtsVoiceRef.current);
-                    } else if (action === 'auto-label') {
-                      handleAutoLabelPieces(lastAutoLabelCharRef.current);
-                    } else if (action === 'generate-sheet' && lastGenSheetParamsRef.current) {
-                      handleGenerateGeminiSheet(
-                        lastGenSheetParamsRef.current.name,
-                        lastGenSheetParamsRef.current.description,
-                        false
-                      );
-                    }
-                  }}
-                  className="px-3 py-1 rounded-md bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-semibold cursor-pointer"
-                >
-                  Retry
-                </button>
-              )}
-              <button
-                type="button"
-                onClick={() => setStatusNotice(null)}
-                className="text-slate-400 hover:text-slate-100 cursor-pointer"
-              >
-                Dismiss
-              </button>
-            </div>
+            <button
+              type="button"
+              onClick={() => setStatusNotice(null)}
+              className="text-slate-400 hover:text-slate-100 cursor-pointer shrink-0"
+            >
+              Dismiss
+            </button>
           </div>
         </div>
       )}
@@ -1287,7 +1092,8 @@ export default function App() {
                             });
                             await handleVideoFileUpload(sampleFile);
                           } catch {
-                            showNotice('Could not load attached reference video.', 'error');
+                            console.warn('[CutoutStage Video] Could not load attached reference video.');
+                            showNotice('Could not load attached reference video.');
                           }
                         }}
                         className="text-[11px] text-amber-400 hover:text-amber-300 underline-offset-2 hover:underline cursor-pointer shrink-0"
@@ -1373,12 +1179,6 @@ export default function App() {
                       ? `${Math.ceil(targetDuration / 15)} storyboard chunks (+1 if coverage < 80%, +1 per new character)`
                       : '1 storyboard call (+1 per new character)'}
                   </div>
-
-                  {modelHealth && modelHealth.models.IMAGE_MODELS.length === 0 && (
-                    <div className="rounded-lg border border-rose-500/70 bg-rose-950/50 px-3 py-2 text-xs text-rose-200 font-medium">
-                      No image model on this key; using low quality SVG
-                    </div>
-                  )}
 
                   <button
                     type="button"
@@ -1614,9 +1414,6 @@ export default function App() {
             onAutoLabelPieces={handleAutoLabelPieces}
             isBusy={isCharBusy}
             liveProgressText={liveProgressText}
-            imageModelsEmpty={Boolean(
-              modelHealth && modelHealth.models.IMAGE_MODELS.length === 0
-            )}
           />
         )}
 
@@ -1631,16 +1428,11 @@ export default function App() {
                 ? `Uploaded video "${uploadedVideoName}" (${targetDuration}s) has not been converted into a storyboard yet. Currently exporting "${timelineSource.label}".`
                 : null
             }
-            audioDataUrl={audioDataUrl}
             exportProgress={exportProgress}
             exportResult={exportResult}
             isExporting={isExporting}
-            isGeneratingTts={isGeneratingTts}
-            liveProgressText={liveProgressText}
             onChangeAspect={setAspectMode}
             onChangeTimeline={setTimelineConfig}
-            onGenerateTts={handleGenerateTts}
-            onUploadAudio={setAudioDataUrl}
             onRunExportMp4={handleExportMp4}
             onSaveFramePng={handleSaveFramePng}
             onGoToStage={() => handleSelectTab('stage')}

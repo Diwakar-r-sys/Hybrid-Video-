@@ -99,8 +99,7 @@ export interface CharacterSheetAsset {
   name: string;
   description: string;
   sheetDataUrl: string;
-  source: 'builtin' | 'gemini-image' | 'gemini-svg-low-quality' | 'uploaded';
-  qualityWarning?: string;
+  source: 'builtin' | 'gemini-svg' | 'uploaded';
   pieces: CutPiece[];
 }
 

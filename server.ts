@@ -5,7 +5,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-dotenv.config();
+dotenv.config({ path: ['.env.local', '.env'], quiet: true });
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -27,71 +27,23 @@ const HAS_CUSTOM_TEXT_MODELS = Boolean(
   process.env.GEMINI_TEXT_MODELS?.trim() || process.env.GEMINI_TEXT_MODEL?.trim()
 );
 
-const BASE_TEXT_MODELS = [
-  'gemini-3.1-flash-lite',
+const DEFAULT_TEXT_MODELS = [
   'gemini-3.8-flash',
-  'gemini-3.6-flash',
-  'gemini-3.5-flash-lite'
+  'gemini-3.5-flash-lite',
+  'gemini-3.1-flash-lite'
 ];
 
-const ALL_KNOWN_TEXT_MODELS = [...BASE_TEXT_MODELS, 'gemini-4-hydrogen'];
-const BASE_IMAGE_MODELS = [
-  'gemini-3.1-flash-lite-image',
-  'gemini-nano-banana-2.1',
-  'gemini-3.1-flash-image',
-  'gemini-3-pro-image'
-];
-const BASE_TTS_MODELS = ['gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts'];
-
-const HAS_CUSTOM_IMAGE_MODELS = Boolean(
-  process.env.GEMINI_IMAGE_MODELS?.trim() || process.env.GEMINI_IMAGE_MODEL?.trim()
+const INITIAL_TEXT_MODELS = parseEnvModelList(
+  process.env.GEMINI_TEXT_MODELS,
+  process.env.GEMINI_TEXT_MODEL,
+  DEFAULT_TEXT_MODELS
 );
-const HAS_CUSTOM_TTS_MODELS = Boolean(
-  process.env.GEMINI_TTS_MODELS?.trim() || process.env.GEMINI_TTS_MODEL?.trim()
-);
-
-const INITIAL_TEXT_MODELS = HAS_CUSTOM_TEXT_MODELS
-  ? parseEnvModelList(
-      process.env.GEMINI_TEXT_MODELS,
-      process.env.GEMINI_TEXT_MODEL,
-      BASE_TEXT_MODELS
-    )
-  : [...ALL_KNOWN_TEXT_MODELS];
-const INITIAL_IMAGE_MODELS = HAS_CUSTOM_IMAGE_MODELS
-  ? parseEnvModelList(
-      process.env.GEMINI_IMAGE_MODELS,
-      process.env.GEMINI_IMAGE_MODEL,
-      BASE_IMAGE_MODELS
-    )
-  : [...BASE_IMAGE_MODELS];
-const INITIAL_TTS_MODELS = HAS_CUSTOM_TTS_MODELS
-  ? parseEnvModelList(
-      process.env.GEMINI_TTS_MODELS,
-      process.env.GEMINI_TTS_MODEL,
-      BASE_TTS_MODELS
-    )
-  : [...BASE_TTS_MODELS];
 
 export const MODEL_CONFIG = {
-  TEXT_MODELS: parseEnvModelList(
-    process.env.GEMINI_TEXT_MODELS,
-    process.env.GEMINI_TEXT_MODEL,
-    BASE_TEXT_MODELS
-  ),
-  IMAGE_MODELS: parseEnvModelList(
-    process.env.GEMINI_IMAGE_MODELS,
-    process.env.GEMINI_IMAGE_MODEL,
-    BASE_IMAGE_MODELS
-  ),
-  TTS_MODELS: parseEnvModelList(
-    process.env.GEMINI_TTS_MODELS,
-    process.env.GEMINI_TTS_MODEL,
-    BASE_TTS_MODELS
-  )
+  TEXT_MODELS: [...INITIAL_TEXT_MODELS]
 };
 
 let modelsDiscoveredForKey = false;
-let lastDiscoveryFallbacks: Partial<Record<'TEXT_MODELS' | 'IMAGE_MODELS' | 'TTS_MODELS', string[]>> = {};
 
 export function compareModelsNewestFirst(a: string, b: string): number {
   const numsA = (a.match(/\d+/g) || []).map(Number);
@@ -118,69 +70,6 @@ function isDiscoveredTextModel(name: string): boolean {
   );
 }
 
-function isDiscoveredImageModel(name: string): boolean {
-  return name.toLowerCase().includes('image');
-}
-
-function isDiscoveredTtsModel(name: string): boolean {
-  return name.toLowerCase().includes('tts');
-}
-
-function resolveDiscoveredCategory(
-  kind: 'TEXT_MODELS' | 'IMAGE_MODELS' | 'TTS_MODELS',
-  knownList: string[],
-  availableUnique: string[],
-  availableSet: Set<string>,
-  matcher: (name: string) => boolean
-): { models: string[]; usedFallback: boolean } {
-  const knownPresent = knownList.filter((m) => availableSet.has(m));
-  const knownPresentSet = new Set(knownPresent);
-  const matchingExtras = availableUnique
-    .filter((m) => !knownPresentSet.has(m) && matcher(m))
-    .sort(compareModelsNewestFirst);
-
-  if (knownPresent.length === 0 && matchingExtras.length > 0) {
-    console.warn(
-      `[Models] Fallback used for ${kind} (no known models available); selected discovered models newest-first: ${matchingExtras.join(', ')}`
-    );
-    return { models: matchingExtras, usedFallback: true };
-  }
-
-  if (matchingExtras.length > 0) {
-    console.info(
-      `[Models] Added newly discovered ${kind} after known models: ${matchingExtras.join(', ')}`
-    );
-  } else if (knownPresent.length === 0) {
-    console.warn(
-      `[Models] Warning: ${kind} is empty after discovery and name-based fallback.`
-    );
-  }
-
-  return { models: [...knownPresent, ...matchingExtras], usedFallback: false };
-}
-
-function getModelHealthWarnings(): {
-  emptyCategories: Array<'TEXT_MODELS' | 'IMAGE_MODELS' | 'TTS_MODELS'>;
-  warnings: string[];
-} {
-  const emptyCategories: Array<'TEXT_MODELS' | 'IMAGE_MODELS' | 'TTS_MODELS'> = [];
-  const warnings: string[] = [];
-
-  if (MODEL_CONFIG.TEXT_MODELS.length === 0) {
-    emptyCategories.push('TEXT_MODELS');
-    warnings.push('No text model available on this key.');
-  }
-  if (MODEL_CONFIG.IMAGE_MODELS.length === 0) {
-    emptyCategories.push('IMAGE_MODELS');
-    warnings.push('No image model on this key; using low quality SVG');
-  }
-  if (MODEL_CONFIG.TTS_MODELS.length === 0) {
-    emptyCategories.push('TTS_MODELS');
-    warnings.push('No TTS voice model available on this key.');
-  }
-  return { emptyCategories, warnings };
-}
-
 function syncDiscoveredModels(availableNames: string[]): void {
   const availableUnique: string[] = [];
   const availableSet = new Set<string>();
@@ -192,42 +81,33 @@ function syncDiscoveredModels(availableNames: string[]): void {
     }
   }
 
-  const textRes = resolveDiscoveredCategory(
-    'TEXT_MODELS',
-    INITIAL_TEXT_MODELS,
-    availableUnique,
-    availableSet,
-    isDiscoveredTextModel
-  );
-  const imgRes = resolveDiscoveredCategory(
-    'IMAGE_MODELS',
-    INITIAL_IMAGE_MODELS,
-    availableUnique,
-    availableSet,
-    isDiscoveredImageModel
-  );
-  const ttsRes = resolveDiscoveredCategory(
-    'TTS_MODELS',
-    INITIAL_TTS_MODELS,
-    availableUnique,
-    availableSet,
-    isDiscoveredTtsModel
-  );
+  const baseList = HAS_CUSTOM_TEXT_MODELS ? INITIAL_TEXT_MODELS : DEFAULT_TEXT_MODELS;
+  const knownPresent = baseList.filter((m) => availableSet.has(m));
+  const knownPresentSet = new Set(knownPresent);
+  const matchingExtras = availableUnique
+    .filter((m) => !knownPresentSet.has(m) && isDiscoveredTextModel(m))
+    .sort(compareModelsNewestFirst);
 
-  MODEL_CONFIG.TEXT_MODELS.splice(0, MODEL_CONFIG.TEXT_MODELS.length, ...textRes.models);
-  MODEL_CONFIG.IMAGE_MODELS.splice(0, MODEL_CONFIG.IMAGE_MODELS.length, ...imgRes.models);
-  MODEL_CONFIG.TTS_MODELS.splice(0, MODEL_CONFIG.TTS_MODELS.length, ...ttsRes.models);
-
-  const fallbacks: Partial<Record<'TEXT_MODELS' | 'IMAGE_MODELS' | 'TTS_MODELS', string[]>> = {};
-  if (textRes.usedFallback) fallbacks.TEXT_MODELS = textRes.models;
-  if (imgRes.usedFallback) fallbacks.IMAGE_MODELS = imgRes.models;
-  if (ttsRes.usedFallback) fallbacks.TTS_MODELS = ttsRes.models;
-  lastDiscoveryFallbacks = fallbacks;
+  if (knownPresent.length === 0 && matchingExtras.length > 0) {
+    console.warn(
+      `[Models] Using discovered flash text models (newest-first): ${matchingExtras.join(', ')}`
+    );
+    MODEL_CONFIG.TEXT_MODELS.splice(0, MODEL_CONFIG.TEXT_MODELS.length, ...matchingExtras);
+  } else if (knownPresent.length > 0 || matchingExtras.length > 0) {
+    MODEL_CONFIG.TEXT_MODELS.splice(
+      0,
+      MODEL_CONFIG.TEXT_MODELS.length,
+      ...knownPresent,
+      ...matchingExtras
+    );
+  }
 
   modelsDiscoveredForKey = true;
 }
 
-async function listAvailableModelNames(ai: GoogleGenAI): Promise<Array<{ name: string; displayName?: string }>> {
+async function listAvailableModelNames(
+  ai: GoogleGenAI
+): Promise<Array<{ name: string; displayName?: string }>> {
   const pager = await ai.models.list();
   const available: Array<{ name: string; displayName?: string }> = [];
   for await (const m of pager) {
@@ -247,12 +127,23 @@ const ATTEMPTS_PER_MODEL = 2;
 const app = express();
 app.use(express.json({ limit: '35mb' }));
 
+function getConfiguredApiKey(): string | null {
+  const raw = (process.env.GEMINI_API_KEY || '').trim().replace(/^['"]|['"]$/g, '');
+  if (!raw || /^(MY_GEMINI_API_KEY|YOUR_|PLACEHOLDER|REPLACE)/i.test(raw)) {
+    return null;
+  }
+  return raw;
+}
+
 function getGeminiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = getConfiguredApiKey();
   if (!apiKey) {
-    throw new Error(
-      'GEMINI_API_KEY is not configured. Add it in Settings > Secrets to run AI analysis and voice synthesis.'
-    );
+    const err = new Error(
+      'GEMINI_API_KEY is not configured (or still a placeholder). Add a valid key in Settings > Secrets.'
+    ) as RetryableError;
+    err.status = 401;
+    err.retryable = false;
+    throw err;
   }
   const baseUrl = process.env.GOOGLE_GEMINI_BASE_URL?.trim();
   return new GoogleGenAI({
@@ -531,16 +422,12 @@ export async function generateWithRetry(
 }
 
 app.get('/api/health', async (_req, res) => {
-  if (!process.env.GEMINI_API_KEY) {
-    const { emptyCategories, warnings } = getModelHealthWarnings();
+  if (!getConfiguredApiKey()) {
     res.json({
       ok: true,
       hasApiKey: false,
       modelsDiscovered: modelsDiscoveredForKey,
-      models: MODEL_CONFIG,
-      emptyCategories,
-      warnings,
-      fallbacksUsed: lastDiscoveryFallbacks
+      models: MODEL_CONFIG
     });
     return;
   }
@@ -548,28 +435,20 @@ app.get('/api/health', async (_req, res) => {
   try {
     const ai = getGeminiClient();
     await listAvailableModelNames(ai);
-    const { emptyCategories, warnings } = getModelHealthWarnings();
     res.json({
       ok: true,
       hasApiKey: true,
       modelsDiscovered: modelsDiscoveredForKey,
-      models: MODEL_CONFIG,
-      emptyCategories,
-      warnings,
-      fallbacksUsed: lastDiscoveryFallbacks
+      models: MODEL_CONFIG
     });
   } catch (err: unknown) {
     const info = extractApiErrorInfo(err);
-    const { emptyCategories, warnings } = getModelHealthWarnings();
     res.json({
       ok: true,
       hasApiKey: false,
       apiKeyError: info.message,
       modelsDiscovered: modelsDiscoveredForKey,
-      models: MODEL_CONFIG,
-      emptyCategories,
-      warnings,
-      fallbacksUsed: lastDiscoveryFallbacks
+      models: MODEL_CONFIG
     });
   }
 });
@@ -578,26 +457,18 @@ app.get('/api/models', async (_req, res) => {
   try {
     const ai = getGeminiClient();
     const available = await listAvailableModelNames(ai);
-    const { emptyCategories, warnings } = getModelHealthWarnings();
     res.json({
       ok: true,
       configured: MODEL_CONFIG,
-      emptyCategories,
-      warnings,
-      fallbacksUsed: lastDiscoveryFallbacks,
       available
     });
   } catch (err: unknown) {
     const info = extractApiErrorInfo(err);
-    const { emptyCategories, warnings } = getModelHealthWarnings();
     res.status(info.status >= 400 && info.status < 600 ? info.status : 500).json({
       ok: false,
       error: info.message,
       code: info.status,
-      configured: MODEL_CONFIG,
-      emptyCategories,
-      warnings,
-      fallbacksUsed: lastDiscoveryFallbacks
+      configured: MODEL_CONFIG
     });
   }
 });
@@ -1538,68 +1409,8 @@ app.post('/api/generate-character-sheet', async (req, res) => {
       }
     }
 
-    const imagePrompt = `Use the reference as the exact character: "${characterName}" (${description}).
-Draw a clean 2D paper-cutout animation character parts kit on a solid #FF00FF magenta background, 1:1 square layout, separated cleanly on an 80px grid with generous #FF00FF empty space between every piece so no pieces touch or overlap.
-Include these separate non-overlapping pieces, with all hidden areas (armpits, shoulders, hips, neck) cleanly drawn:
-1. HEAD (full head, hair/hat/crown/helmet, face, and short neck stub at bottom center)
-2. TORSO without arms (full coat/dress/tunic/armor, no arms attached)
-3. LEFT UPPER ARM (shoulder to elbow)
-4. LEFT FOREARM+HAND (elbow to hand)
-5. RIGHT UPPER ARM (shoulder to elbow)
-6. RIGHT FOREARM+HAND (elbow to hand)
-7. KNITTING NEEDLES / HAND PROP (if character holds a prop such as knitting needles, scepter, spear, or tool)
-8. SCARF STRIP / ACCESSORY (scarf strip, sash, or shield)
-9. LEFT LEG+SHOE
-10. RIGHT LEG+SHOE
-
-Style rules: flat 2D cartoon storybook illustration, thin dark brown outline (#3a2418), soft paper texture, no white outline, no shadows, no text, no labels, no grid lines drawn, solid #FF00FF chroma background only.`;
-
-    // Primary path: IMAGE_MODELS via generateContent
-    if (MODEL_CONFIG.IMAGE_MODELS.length > 0) {
-      try {
-        responder.sendProgress(`Generating #FF00FF character parts sheet for ${characterName}...`);
-        const { result: imgResp, modelUsed } = await generateWithRetry(
-          ai,
-          {
-            contents: {
-              parts: [...refImageParts, { text: imagePrompt }]
-            },
-            config: {
-              imageConfig: {
-                aspectRatio: '1:1'
-              }
-            }
-          },
-          MODEL_CONFIG.IMAGE_MODELS,
-          responder.sendProgress
-        );
-
-        const partsOut = imgResp.candidates?.[0]?.content?.parts ?? [];
-        for (const p of partsOut) {
-          if (p.inlineData?.data) {
-            const mime = p.inlineData.mimeType || 'image/png';
-            responder.sendJson(200, {
-              sheetDataUrl: `data:${mime};base64,${p.inlineData.data}`,
-              source: 'gemini-image',
-              modelUsed
-            });
-            return;
-          }
-        }
-        console.warn('[CharacterSheet] Image model returned no inlineData part; falling back to low-quality SVG.');
-      } catch (imgErr: unknown) {
-        const imgInfo = extractApiErrorInfo(imgErr);
-        if (imgInfo.status === 401) {
-          throw imgErr;
-        }
-        console.warn('[CharacterSheet] IMAGE_MODELS failed, falling back to low-quality SVG:', imgInfo.message);
-        responder.sendProgress(
-          `Image model unavailable (${imgInfo.message}); using low quality SVG fallback...`
-        );
-      }
-    }
-
-    // Last-resort fallback: TEXT_MODELS SVG generation labelled "low quality"
+    // Generate crisp layered SVG cutout rig parts via TEXT_MODELS (gemini-3.8-flash primary)
+    responder.sendProgress(`Generating vector cutout parts kit for ${characterName}...`);
     const svgParts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [
       ...refImageParts,
       {
@@ -1650,8 +1461,7 @@ Rules for every SVG part:
     const parsed = JSON.parse((response.text ?? '{}').trim());
     responder.sendJson(200, {
       partsSvgMap: parsed,
-      source: 'gemini-svg-low-quality',
-      qualityWarning: 'low quality',
+      source: 'gemini-svg',
       modelUsed
     });
   } catch (err: unknown) {
@@ -1731,116 +1541,7 @@ app.post('/api/auto-label-parts', async (req, res) => {
   }
 });
 
-export function wrapRawPcm16MonoAsWav(
-  rawBuf: Buffer,
-  sampleRate = 24000,
-  numChannels = 1,
-  bitsPerSample = 16
-): Buffer {
-  // If upstream already returned a valid RIFF/WAVE header, do not double-wrap
-  if (
-    rawBuf.length >= 44 &&
-    rawBuf.subarray(0, 4).toString('ascii') === 'RIFF' &&
-    rawBuf.subarray(8, 12).toString('ascii') === 'WAVE'
-  ) {
-    return rawBuf;
-  }
 
-  const blockAlign = (numChannels * bitsPerSample) / 8;
-  const byteRate = sampleRate * blockAlign;
-  const dataSize = rawBuf.length;
-  const header = Buffer.alloc(44);
-
-  header.write('RIFF', 0, 'ascii');
-  header.writeUInt32LE(36 + dataSize, 4);
-  header.write('WAVE', 8, 'ascii');
-  header.write('fmt ', 12, 'ascii');
-  header.writeUInt32LE(16, 16); // PCM fmt chunk size
-  header.writeUInt16LE(1, 20); // PCM format = 1
-  header.writeUInt16LE(numChannels, 22);
-  header.writeUInt32LE(sampleRate, 24);
-  header.writeUInt32LE(byteRate, 28);
-  header.writeUInt16LE(blockAlign, 32);
-  header.writeUInt16LE(bitsPerSample, 34);
-  header.write('data', 36, 'ascii');
-  header.writeUInt32LE(dataSize, 40);
-
-  return Buffer.concat([header, rawBuf]);
-}
-
-app.post('/api/tts', async (req, res) => {
-  const responder = createResponder(req, res);
-  try {
-    const ai = getGeminiClient();
-    const {
-      text,
-      voiceName = 'Kore',
-      style = 'expressive storybook narrator voice'
-    } = req.body as {
-      text: string;
-      voiceName?: string;
-      style?: string;
-    };
-    if (!text || !text.trim()) {
-      responder.sendJson(400, { error: 'Narration text is required', retryable: false });
-      return;
-    }
-
-    const cleanStyle = style.trim().replace(/^say in (a|an)\s+/i, '').replace(/:\s*$/, '');
-    const styledPrompt = `Say in an ${cleanStyle}: ${text.trim()}`;
-
-    const { result: response, modelUsed } = await generateWithRetry(
-      ai,
-      {
-        contents: [
-          {
-            role: 'user',
-            parts: [{ text: styledPrompt }]
-          }
-        ],
-        config: {
-          responseModalities: ['AUDIO'],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName }
-            }
-          }
-        }
-      },
-      MODEL_CONFIG.TTS_MODELS,
-      responder.sendProgress
-    );
-
-    const inlineAudio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData;
-    const base64Audio = inlineAudio?.data;
-    if (!base64Audio) {
-      responder.sendJson(502, { error: 'No audio returned by TTS model', retryable: true });
-      return;
-    }
-
-    const rawBytes = Buffer.from(base64Audio, 'base64');
-    const wavBuffer = wrapRawPcm16MonoAsWav(rawBytes, 24000, 1, 16);
-    const wavBase64 = wavBuffer.toString('base64');
-
-    responder.sendJson(200, {
-      audioDataUrl: `data:audio/wav;base64,${wavBase64}`,
-      modelUsed,
-      sampleRate: 24000,
-      channels: 1,
-      bitsPerSample: 16
-    });
-  } catch (err: unknown) {
-    const info = extractApiErrorInfo(err);
-    console.error('TTS error:', err);
-    const code = info.status >= 400 && info.status < 600 ? info.status : 500;
-    responder.sendJson(code, {
-      error: info.message,
-      code,
-      retryable: info.retryable,
-      ...(info.failures ? { failedModels: info.failures } : {})
-    });
-  }
-});
 
 // Return JSON 404 for unknown /api/* routes before SPA fallback
 app.use('/api', (req, res) => {
@@ -1886,7 +1587,7 @@ async function startServer() {
     });
   }
 
-  if (process.env.GEMINI_API_KEY) {
+  if (getConfiguredApiKey()) {
     try {
       await listAvailableModelNames(getGeminiClient());
     } catch (err) {

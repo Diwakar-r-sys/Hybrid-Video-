@@ -21,7 +21,6 @@ interface CharacterStudioProps {
   onAutoLabelPieces: (charName: string) => Promise<void>;
   isBusy: boolean;
   liveProgressText?: string | null;
-  imageModelsEmpty?: boolean;
 }
 
 const PIECE_ROLES: PieceRole[] = [
@@ -52,8 +51,7 @@ export const CharacterStudio: React.FC<CharacterStudioProps> = ({
   onGenerateGeminiSheet,
   onAutoLabelPieces,
   isBusy,
-  liveProgressText,
-  imageModelsEmpty = false
+  liveProgressText
 }) => {
   const activeChar =
     characters.find((c) => c.name === activeCharacterName) || characters[0];
@@ -111,16 +109,9 @@ export const CharacterStudio: React.FC<CharacterStudioProps> = ({
               <span className="font-semibold text-slate-200">
                 Active Sheet · {activeChar?.name}
               </span>
-              <div className="flex items-center gap-2">
-                {(activeChar?.source === 'gemini-svg-low-quality' || activeChar?.qualityWarning) && (
-                  <span className="px-2 py-0.5 rounded bg-amber-500/20 border border-amber-500/50 text-amber-300 font-semibold">
-                    {activeChar?.qualityWarning || 'low quality'}
-                  </span>
-                )}
-                <span className="font-mono text-slate-400">
-                  Source: {activeChar?.source}
-                </span>
-              </div>
+              <span className="font-mono text-slate-400">
+                Source: {activeChar?.source}
+              </span>
             </div>
 
             {activeChar?.sheetDataUrl && (
@@ -206,13 +197,8 @@ export const CharacterStudio: React.FC<CharacterStudioProps> = ({
 
           <div className="rounded-xl border border-slate-800 bg-[#12151d] p-4 space-y-3">
             <div className="text-xs font-semibold text-slate-200">
-              Generate Custom Paper-Cutout Character Rig (Gemini)
+              Generate Custom Paper-Cutout Character Rig (SVG / Canvas)
             </div>
-            {imageModelsEmpty && (
-              <div className="rounded-lg border border-rose-500/70 bg-rose-950/50 px-3 py-2 text-xs text-rose-200 font-medium">
-                No image model on this key; using low quality SVG
-              </div>
-            )}
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
               <input
                 type="text"
